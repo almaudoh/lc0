@@ -30,6 +30,7 @@
 #include <fstream>
 
 #include "utils/cppattributes.h"
+#include "neural/network.h"
 
 #pragma once
 
@@ -65,6 +66,8 @@ struct V5TrainingData {
 } PACKED_STRUCT;
 static_assert(sizeof(V5TrainingData) == 8308, "Wrong struct size");
 
+InputPlanes PlanesFromTrainingData(const V5TrainingData& data);
+
 #pragma pack(pop)
 
 class TrainingDataWriter {
@@ -72,6 +75,7 @@ class TrainingDataWriter {
   // Creates a new file to write in data directory. It will has @game_id
   // somewhere in the filename.
   TrainingDataWriter(int game_id);
+  TrainingDataWriter(std::string filename);
 
   ~TrainingDataWriter() {
     if (fout_) Finalize();
@@ -89,6 +93,25 @@ class TrainingDataWriter {
  private:
   std::string filename_;
   gzFile fout_;
+};
+
+class TrainingDataReader {
+ public:
+  // Opens the given file to read chunk data from.
+  TrainingDataReader(std::string filename);
+
+  ~TrainingDataReader();
+
+  // Reads a chunk. Returns true if a chunk was read.
+  bool ReadChunk(V5TrainingData* data);
+
+  // Gets full filename of the file being read.
+  std::string GetFileName() const { return filename_; }
+
+ private:
+  std::string filename_;
+  gzFile fin_;
+  bool format_v5 = false;
 };
 
 }  // namespace lczero

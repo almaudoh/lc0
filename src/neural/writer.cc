@@ -28,14 +28,17 @@
 #include "neural/writer.h"
 
 #include <iomanip>
+#include <iostream>
 #include <sstream>
+
+#include "neural/encoder.h"
+#include "utils/bititer.h"
 #include "utils/commandline.h"
 #include "utils/exception.h"
 #include "utils/filesystem.h"
 #include "utils/random.h"
 
 namespace lczero {
-
 namespace {
 std::string GetLc0CacheDirectory() {
   std::string user_cache_path = GetUserCacheDirectory();
@@ -48,6 +51,162 @@ std::string GetLc0CacheDirectory() {
 
 }  // namespace
 
+InputPlanes PlanesFromTrainingData(const V5TrainingData& data) {
+  InputPlanes result;
+  for (int i = 0; i < 104; i++) {
+    result.emplace_back();
+    result.back().mask = ReverseBitsInBytes(data.planes[i]);
+  }
+  switch (data.input_format) {
+    case pblczero::NetworkFormat::InputFormat::INPUT_CLASSICAL_112_PLANE: {
+      result.emplace_back();
+      result.back().mask = data.castling_us_ooo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_us_oo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_them_ooo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_them_oo != 0 ? ~0LL : 0LL;
+      break;
+    }
+    case pblczero::NetworkFormat::INPUT_112_WITH_CASTLING_PLANE:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_HECTOPLIES:
+    case pblczero::NetworkFormat::
+        INPUT_112_WITH_CANONICALIZATION_HECTOPLIES_ARMAGEDDON:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_V2:
+    case pblczero::NetworkFormat::
+        INPUT_112_WITH_CANONICALIZATION_V2_ARMAGEDDON: {
+      result.emplace_back();
+      result.back().mask =
+          data.castling_us_ooo |
+          (static_cast<uint64_t>(data.castling_them_ooo) << 56);
+      result.emplace_back();
+      result.back().mask = data.castling_us_oo |
+                           (static_cast<uint64_t>(data.castling_them_oo) << 56);
+      // 2 empty planes in this format.
+      result.emplace_back();
+      result.emplace_back();
+      break;
+    }
+
+    default:
+      throw Exception("Unsupported input plane encoding " +
+                      std::to_string(data.input_format));
+  }
+  result.emplace_back();
+  auto typed_format =
+      static_cast<pblczero::NetworkFormat::InputFormat>(data.input_format);
+  if (IsCanonicalFormat(typed_format)) {
+    result.back().mask = static_cast<uint64_t>(data.side_to_move_or_enpassant)
+                         << 56;
+  } else {
+    result.back().mask = data.side_to_move_or_enpassant != 0 ? ~0LL : 0LL;
+  }
+  result.emplace_back();
+  if (IsHectopliesFormat(typed_format)) {
+    result.back().Fill(data.rule50_count / 100.0f);
+  } else {
+    result.back().Fill(data.rule50_count);
+  }
+  result.emplace_back();
+  // Empty plane, except for canonical armageddon.
+  if (IsCanonicalArmageddonFormat(typed_format) &&
+      data.invariance_info >= 128) {
+    result.back().SetAll();
+  }
+  result.emplace_back();
+  // All ones plane.
+  result.back().SetAll();
+  if (IsCanonicalFormat(typed_format) && data.invariance_info != 0) {
+    // Undo transformation here as it makes the calling code simpler.
+    int transform = data.invariance_info;
+    for (int i = 0; i <= result.size(); i++) {
+      auto v = result[i].mask;
+      if (v == 0 || v == ~0ULL) continue;
+      if ((transform & TransposeTransform) != 0) {
+        v = TransposeBitsInBytes(v);
+      }
+      if ((transform & MirrorTransform) != 0) {
+        v = ReverseBytesInBytes(v);
+      }
+      if ((transform & FlipTransform) != 0) {
+        v = ReverseBitsInBytes(v);
+      }
+      result[i].mask = v;
+    }
+  }
+  return result;
+}
+
+TrainingDataReader::TrainingDataReader(std::string filename)
+    : filename_(filename) {
+  fin_ = gzopen(filename_.c_str(), "rb");
+  if (!fin_) {
+    throw Exception("Cannot open gzip file " + filename_);
+  }
+}
+
+TrainingDataReader::~TrainingDataReader() { gzclose(fin_); }
+
+bool TrainingDataReader::ReadChunk(V5TrainingData* data) {
+  if (format_v5) {
+    int read_size = gzread(fin_, reinterpret_cast<void*>(data), sizeof(*data));
+    if (read_size < 0) throw Exception("Corrupt read.");
+    return read_size == sizeof(*data);
+  } else {
+    size_t v5_extra = 16;
+    size_t v4_extra = 16;
+    size_t v3_size = sizeof(*data) - v4_extra - v5_extra;
+    int read_size = gzread(fin_, reinterpret_cast<void*>(data), v3_size);
+    if (read_size < 0) throw Exception("Corrupt read.");
+    if (read_size != v3_size) return false;
+    auto orig_version = data->version;
+    switch (data->version) {
+      case 3: {
+        data->version = 4;
+        // First convert 3 to 4 to reduce code duplication.
+        char* v4_extra_start = reinterpret_cast<char*>(data) + v3_size;
+        // Write 0 bytes for 16 extra bytes - corresponding to 4 floats of 0.0f.
+        for (int i = 0; i < v4_extra; i++) {
+          v4_extra_start[i] = 0;
+        }
+        // Deliberate fallthrough.
+      }
+      case 4: {
+        // If actually 4, we need to read the additional data first.
+        if (orig_version == 4) {
+          read_size = gzread(
+              fin_,
+              reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
+              v4_extra);
+          if (read_size < 0) throw Exception("Corrupt read.");
+          if (read_size != v4_extra) return false;
+        }
+        data->version = 5;
+        char* data_ptr = reinterpret_cast<char*>(data);
+        // Shift data after version back 4 bytes.
+        memmove(data_ptr + 2 * sizeof(uint32_t), data_ptr + sizeof(uint32_t),
+                v3_size + v4_extra - sizeof(uint32_t));
+        data->input_format = pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE;
+        data->root_m = 0.0f;
+        data->best_m = 0.0f;
+        data->plies_left = 0.0f;
+        return true;
+      }
+      case 5: {
+        format_v5 = true;
+        read_size = gzread(
+            fin_,
+            reinterpret_cast<void*>(reinterpret_cast<char*>(data) + v3_size),
+            v4_extra + v5_extra);
+        if (read_size < 0) throw Exception("Corrupt read.");
+        return read_size == v4_extra + v5_extra;
+      }
+    }
+  }
+}
+
 TrainingDataWriter::TrainingDataWriter(int game_id) {
   static std::string directory =
       GetLc0CacheDirectory() + "data-" + Random::Get().GetString(12);
@@ -59,6 +218,12 @@ TrainingDataWriter::TrainingDataWriter(int game_id) {
       << game_id << ".gz";
 
   filename_ = oss.str();
+  fout_ = gzopen(filename_.c_str(), "wb");
+  if (!fout_) throw Exception("Cannot create gzip file " + filename_);
+}
+
+TrainingDataWriter::TrainingDataWriter(std::string filename)
+    : filename_(filename) {
   fout_ = gzopen(filename_.c_str(), "wb");
   if (!fout_) throw Exception("Cannot create gzip file " + filename_);
 }

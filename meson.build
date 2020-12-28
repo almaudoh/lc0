@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
 
-project('lc0', 'cpp',
+project('rescorer', ['c', 'cpp'],
         default_options : ['cpp_std=c++17', 'b_ndebug=if-release', 'warning_level=3', 'b_lto=true', 'b_vscrt=mt'],
         meson_version: '>=0.52')
 
@@ -167,8 +167,28 @@ files += [
   'src/utils/random.cc',
   'src/utils/string.cc',
   'src/utils/weights_adapter.cc',
+  'src/gaviotatb/gtb-probe.c',
+  'src/gaviotatb/gtb-dec.c',
+  'src/gaviotatb/gtb-att.c',
+  'src/gaviotatb/sysport/sysport.c',
+  'src/gaviotatb/compression/wrap.c',
+  'src/gaviotatb/compression/huffman/hzip.c',
+  'src/gaviotatb/compression/liblzf/lzf_c.c',
+  'src/gaviotatb/compression/liblzf/lzf_d.c',
+  'src/gaviotatb/compression/lzma/LzmaEnc.c',
+  'src/gaviotatb/compression/lzma/LzmaDec.c',
+  'src/gaviotatb/compression/lzma/Alloc.c',
+  'src/gaviotatb/compression/lzma/LzFind.c',
+  'src/gaviotatb/compression/lzma/Lzma86Enc.c',
+  'src/gaviotatb/compression/lzma/Lzma86Dec.c',
+  'src/gaviotatb/compression/lzma/Bra86.c',
 ]
 includes += include_directories('src')
+includes += include_directories('src/gaviotatb/sysport')
+includes += include_directories('src/gaviotatb/compression')
+includes += include_directories('src/gaviotatb/compression/huffman')
+includes += include_directories('src/gaviotatb/compression/liblzf')
+includes += include_directories('src/gaviotatb/compression/lzma')
 
 deps += dependency('threads')
 
@@ -542,7 +562,7 @@ if get_option('embed')
   add_project_arguments('-DEMBED', language : 'cpp')
 endif
 
-executable('lc0', 'src/main.cc',
+executable('rescorer', 'src/main.cc',
   files, include_directories: includes, dependencies: deps, install: true)
 
 #############################################################################
