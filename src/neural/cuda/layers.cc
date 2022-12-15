@@ -1503,7 +1503,7 @@ void AttentionPolicyHead<DataType>::Eval(
                           num_inputs, 1.0f, (const DataType*)ip_pol_w_,
                           num_inputs, scratch0, num_inputs, 0.0f, pol_embedding,
                           num_outputs);
-    addBiasBatched(pol_embedding, pol_embedding, ip_pol_b_, 1, batch,
+    addBiasBatched<DataType>(pol_embedding, pol_embedding, ip_pol_b_, 1, batch,
                    num_outputs, SELU, stream);
   }
 
@@ -1618,11 +1618,11 @@ void AttentionPolicyHead<DataType>::Eval(
       const int num_inputs = embedding_op_size_;
       const int num_outputs = encoder_dff;
       const int batch = N * 64;
-      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
                   num_inputs, 1.0f, (const DataType*)enc.ffn_dense1_w,
                   num_inputs, scratch0, num_inputs, 0.0f, scratch1,
                   num_outputs);
-      addBiasBatched(scratch1, scratch1, enc.ffn_dense1_b, 1, batch,
+      addBiasBatched<DataType>(scratch1, scratch1, enc.ffn_dense1_b, 1, batch,
                      num_outputs, SELU, stream);
     }
 
