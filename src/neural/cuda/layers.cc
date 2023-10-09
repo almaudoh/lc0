@@ -2300,49 +2300,52 @@ ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
                                ActivationFunction act,
                                int max_batch_size, bool use_gemm_ex)
     : BaseLayer<DataType>(weights.ip_val_b.size(), 8, 8, ip),
-      attention_body_(attention_body),
-      embedding_size_(attention_body ? weights.ip_val_b.size() : weights.value.biases.size()),
-      value_hidden_size_(weights.ip1_val_b.size()),
-      act_(act),
-      wdl_(wdl),
       wdl_err_(wdl_err) {
-  if (attention_body_) {
-    allocAndUpload<DataType>(&ip_val_w_, weights.ip_val_w, scratch);
-    allocAndUpload<DataType>(&ip_val_b_, weights.ip_val_b, scratch);
+  if (attention_body) {
+    auto embedded_val = std::make_unique<EmbeddingLayer<DataType>>(
+        ip, weights.ip_val_w, weights.ip_val_b, scratch,
+        act);
+    layers_.emplace_back(std::move(embedded_val));
   } else {
-    conv_ = std::make_unique<Conv1Layer<DataType>>(
+    auto convVal = std::make_unique<Conv1Layer<DataType>>(
         ip, weights.value.biases.size(), 8, 8, ip->GetC(), act,
         true, use_gemm_ex);
-    conv_->LoadWeights((float*)&weights.value.weights[0],
-                      (float*)&weights.value.biases[0], scratch);
+    convVal->LoadWeights((float*)&weights.value.weights[0],
+                        (float*)&weights.value.biases[0], scratch);
+    layers_.emplace_back(std::move(convVal));
   }
 
-  allocAndUpload<DataType>(&ip1_val_w_, weights.ip1_val_w, scratch);
-  allocAndUpload<DataType>(&ip1_val_b_, weights.ip1_val_b, scratch);
+  auto FCVal1 = std::make_unique<FCLayer<DataType>>(
+      layers_.back().get(), weights.ip1_val_b.size(), 1, 1, true, act);
+  FCVal1->LoadWeights((float*)&weights.ip1_val_w[0],
+                      (float*)&weights.ip1_val_b[0],
+                      scratch);
+  layers_.emplace_back(std::move(FCVal1));
 
-  allocAndUpload<DataType>(&ip2_val_w_, weights.ip2_val_w, scratch);
-  allocAndUpload<DataType>(&ip2_val_b_, weights.ip2_val_b, scratch);
+  auto prev_layer = layers_.back().get();
+  auto FCVal2 = std::make_unique<FCLayer<DataType>>(
+      prev_layer, weights.ip2_val_b.size(), 1, 1, true,
+      wdl ? ACTIVATION_NONE : ACTIVATION_TANH);
+  FCVal2->LoadWeights((float*)&weights.ip2_val_w[0],
+                      (float*)&weights.ip2_val_b[0],
+                      scratch);
+  layers_.emplace_back(std::move(FCVal2));
 
   if (wdl_err_) {
-    allocAndUpload<DataType>(&ip_val_err_w_, weights.ip_val_err_w, scratch);
-    allocAndUpload<DataType>(&ip_val_err_b_, weights.ip_val_err_b, scratch);
+    auto FCValErr = std::make_unique<FCLayer<DataType>>(
+        prev_layer, weights.ip_val_err_b.size(), 1, 1, true,
+        ACTIVATION_SIGMOID);
+    FCValErr->LoadWeights((float*)&weights.ip_val_err_w[0],
+                        (float*)&weights.ip_val_err_b[0],
+                        scratch);
+    layers_.emplace_back(std::move(FCValErr));
+
   }
 }
 
 template <typename DataType>
 ValueHead<DataType>::~ValueHead() {
-  if (attention_body_) {
-    ReportCUDAErrors(cudaFree(ip_val_w_));
-    ReportCUDAErrors(cudaFree(ip_val_b_));
-  }
-  ReportCUDAErrors(cudaFree(ip1_val_w_));
-  ReportCUDAErrors(cudaFree(ip1_val_b_));
-  ReportCUDAErrors(cudaFree(ip2_val_w_));
-  ReportCUDAErrors(cudaFree(ip2_val_b_));
-  if (wdl_err_) {
-    ReportCUDAErrors(cudaFree(ip_val_err_w_));
-    ReportCUDAErrors(cudaFree(ip_val_err_b_));
-  }
+
 }
 
 template <typename DataType>
@@ -2351,60 +2354,24 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
                                size_t scratch_size, cudnnHandle_t /*cudnn*/,
                                cublasHandle_t cublas, cudaStream_t stream,
                                DataType***) {
-  DataType* buffer = (DataType*)input2;
-  {
-    const int num_inputs = this->input_->GetC();
-    const int num_outputs = embedding_size_;
-    const int batch = N * 64;
-    if (attention_body_) {
-      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                            num_inputs, 1.0f, (const DataType*)ip_val_w_, num_inputs,
-                            input, num_inputs, 0.0f, buffer, num_outputs);
-      addBiasBatched<DataType>(buffer, buffer, ip_val_b_, 1, batch, num_outputs, act_, stream);
 
-    } else {
-      conv_->Eval(N, buffer, input, nullptr, scratch,
-                  scratch_size, nullptr, cublas, stream);
-    }
-  }
+  int l = 0;
+  layers_[l++]->Eval(N, output, input, nullptr, scratch,
+                      scratch_size, nullptr, cublas,
+                      stream);  // value conv or embedding
 
-  {
-    // Value dense 1
-    const int num_inputs = embedding_size_ * 64;
-    const int num_outputs = value_hidden_size_;
-    const int batch = N;
-    DataType* layer_out = (DataType*)scratch;
-    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                          num_inputs, 1.0f, (const DataType*)ip1_val_w_, num_inputs,
-                          buffer, num_inputs, 0.0f, layer_out, num_outputs);
-    addBiasBatched<DataType>(layer_out, layer_out, ip1_val_b_, 1, batch,
-                             num_outputs, act_, stream);
-  }
+  layers_[l++]->Eval(N, (DataType*)input2, output, nullptr, scratch,
+                      scratch_size, nullptr, cublas,
+                      stream);  // value FC1
 
-  {
-    // Value dense 2
-    const int num_inputs = value_hidden_size_;
-    const int num_outputs = wdl_ ? 3 : 1;
-    const int batch = N;
-    DataType* layer_out = wdl_err_ ? (DataType*)buffer : (DataType*)output;
-    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                      num_inputs, 1.0f, (const DataType*)ip2_val_w_, num_inputs,
-                      (DataType*)scratch, num_inputs, 0.0f, layer_out, num_outputs);
-    addVectors(layer_out, layer_out, ip2_val_b_, num_outputs * batch,
-               num_outputs * batch, num_outputs, wdl_ ? ACTIVATION_NONE : ACTIVATION_TANH,
-               stream);
-  }
+  layers_[l++]->Eval(N, output, input2, nullptr, scratch,
+                      scratch_size, nullptr, cublas,
+                      stream);  // value FC2
 
   if (wdl_err_) {
-    // Value error dense
-    const int num_inputs = value_hidden_size_;
-    const int num_outputs = 1;
-    const int batch = N;
-    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                      num_inputs, 1.0f, (const DataType*)ip_val_err_w_, num_inputs,
-                      (DataType*)scratch, num_inputs, 0.0f, output, num_outputs);
-    addVectors(output, output, ip_val_err_b_, N,
-               N, 1, ACTIVATION_SIGMOID, stream);
+    layers_[l++]->Eval(N, output, input2, nullptr, scratch,
+                        scratch_size, nullptr, cublas,
+                        stream);  // value FC error
   }
 }
 
