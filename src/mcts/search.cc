@@ -280,7 +280,7 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
   } else if (reported_nodes == "queries") {
     total_nodes = total_nn_queries_;
   } else if (reported_nodes == "playouts" || reported_nodes == "legacy") {
-    total_nodes = total_playouts_;
+    total_nodes = total_playouts_ + initial_visits_;
   }
 
   if (!per_pv_counters) {
