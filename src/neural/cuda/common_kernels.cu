@@ -812,6 +812,9 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
 // each thread processes two elements. Each warp computes a sum (over 64
 // elements)
 template <typename T>
+// __global__ void softmax_opt_64_kernel(T* output, const T* input, const T*
+// skip1,
+//                                       const T* skip2, bool rpe, int N) {
 __global__ void softmax_opt_64_kernel(T* output, const T* input,
                                       const T* input2, int N) {
   int index = blockDim.x * blockIdx.x + threadIdx.x;
@@ -827,6 +830,8 @@ __global__ void softmax_opt_64_kernel(T* output, const T* input,
     copyAs<int>(&inp[0], &input[index * 2]);
     x[0] = (float)inp[0];
     x[1] = (float)inp[1];
+    // if (skip1 != nullptr) {
+    //   copyAs<int>(&inp[0], &skip1[index * 2]);
     if (input2 != nullptr) {
       copyAs<int>(&inp[0], &input2[index * 2]);
       x[2] = (float)inp[0];
@@ -834,11 +839,14 @@ __global__ void softmax_opt_64_kernel(T* output, const T* input,
     }
   } else {
     copyAs<uint2>(&x[0], &input[index * 2]);
+    // if (skip1 != nullptr) {
+    //   copyAs<uint2>(&x[2], &skip1[index * 2]);
     if (input2 != nullptr) {
       copyAs<uint2>(&x[2], &input2[index * 2]);
     }
   }
 
+  // if (skip1 != nullptr) {
   if (input2 != nullptr) {
     x[0] += x[2];
     x[1] += x[3];
@@ -874,6 +882,8 @@ __global__ void softmax_opt_64_kernel(T* output, const T* input,
 // Sums are computed in shared memory
 // C threads per block, N blocks
 template <typename T>
+// __global__ void softmax_kernel(T* output, const T* input, const T* skip1,
+//                                const T* skip2, bool rpe) {
 __global__ void softmax_kernel(T* output, const T* input, const T* input2) {
   int n = blockIdx.x;
   int c = threadIdx.x;
@@ -884,6 +894,13 @@ __global__ void softmax_kernel(T* output, const T* input, const T* input2) {
 
   float x = (float)input[index];
   if (input2 != nullptr) x += (float)input2[index];
+  // // Transposition is needed for rpe.
+  // if (rpe) {
+  //   // RPE-Q:
+  // } else {
+  //   if (skip1 != nullptr) x += (float)skip1[index];
+  //   if (skip2 != nullptr) x += (float)skip2[index];
+  // }
 
   __shared__ float sum, maxval;
   if (c == 0) {
@@ -915,15 +932,20 @@ __global__ void softmax_kernel(T* output, const T* input, const T* input2) {
 }
 
 template <typename T>
+// void Softmax(int N, int C, T* output, const T* input, const T* skip1,
+//              const T* skip2, bool rpe, cudaStream_t stream) {
 void Softmax(int N, int C, T* output, const T* input, const T* input2,
              cudaStream_t stream) {
   if (C == 64) {
     int size = N * 32;  // Total no of threads needed
     const int kBlockSize = 256;
     int blocks = DivUp(size, kBlockSize);
+    // softmax_opt_64_kernel<T><<<blocks, kBlockSize, 0, stream>>>(
+    //     output, input, skip1, skip2, rpe, size);
     softmax_opt_64_kernel<T>
         <<<blocks, kBlockSize, 0, stream>>>(output, input, input2, size);
   } else {
+    // softmax_kernel<T><<<N, C, 0, stream>>>(output, input, skip1, skip2, rpe);
     softmax_kernel<T><<<N, C, 0, stream>>>(output, input, input2);
   }
 
@@ -1400,8 +1422,8 @@ __global__ void rpeVectorMultiply_kernel(const T* rpeInput, const T* rpeWeights,
 
   if (rpetype == 0) {
     // RPE-Q
-    // rpeInput:   [B, Q, H, D] -> transpose to [B, H, Q, (1, D)]
-    // rpeWeights: [H, Q, D, K] -> transpose to [1, H, Q, (D, K)]
+    // rpeInput:   [B, Q, H, D]
+    // rpeWeights: [Q, H, K, D]
     // output:     [B, H, Q, K]
 
     // Read tensors per the input layouts and write out per the output layout.
@@ -1410,12 +1432,13 @@ __global__ void rpeVectorMultiply_kernel(const T* rpeInput, const T* rpeWeights,
     if (b >= B || h >= H || q >= Q || k >= K) return;
 
     const int tensorIndex = getTensorIndex(b, q, h, 0, B, Q, H, D);
-    const int weightIndex = getTensorIndex(h, q, k, 0, H, Q, K, D);
+    const int weightIndex = getTensorIndex(q, h, k, 0, Q, H, K, D);
 
     T sum = dotProductSum(rpeInput + tensorIndex, rpeWeights + weightIndex, D,
                           fp16);
     int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-    output[outIdx] = ((T)sum + (T)skipAdd[outIdx]) * (T)outScale;
+    // output[outIdx] = ((T)sum + (T)skipAdd[outIdx]) * (T)outScale;
+    output[outIdx] = (T)sum;
   } else if (rpetype == 1) {
     // RPE-K
     // rpeInput:   [B, K, H, D] -> transpose to [B, H, K, (1, D)]
@@ -1766,8 +1789,12 @@ template void OutputInputTransform<float, false, ACTIVATION_MISH, true, false>(
 
 template void Softmax<half>(int N, int C, half* output, const half* input,
                             const half* input2, cudaStream_t stream);
+//                          const half* skip1, const half* skip2, bool rpe,
+//                          cudaStream_t stream);
 template void Softmax<float>(int N, int C, float* output, const float* input,
                              const float* input2, cudaStream_t stream);
+//                          const float* skip1, const float* skip2, bool rpe,
+//                          cudaStream_t stream);
 
 template void LayerNorm<half>(int N, int C, half* output, const half* input,
                               const half* bias, const half* skip,

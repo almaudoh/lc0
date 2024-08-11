@@ -354,7 +354,7 @@ class EncoderBlock {
   DataType *mha_qkv_w, *mha_qkv_b;
   DataType *mha_dense_w, *mha_dense_b;
   DataType *mha_rpe_q, *mha_rpe_k, *mha_rpe_v;
-  DataType *mha_rpe_factorizer;
+  DataType* mha_rpe_factorizer;
 
   DataType *ln1_gammas, *ln1_betas;
 
@@ -363,12 +363,12 @@ class EncoderBlock {
 
   DataType *ln2_gammas, *ln2_betas;
 
-  DataType *smol_compress;
+  DataType* smol_compress;
   DataType *smol_dense1_w, *smol_dense1_b;
   DataType *smol_dense2_w, *smol_dense2_b;
   DataType *smol_ln1_gammas, *smol_ln1_betas;
   DataType *smol_ln2_gammas, *smol_ln2_betas;
-  DataType *smol_global;
+  DataType* smol_global;
 
   int mha_q_size_;
   int mha_k_size_;
@@ -398,6 +398,22 @@ class EncoderBlock {
   int smol_global_size_;
 
   const int max_batch_size_;
+
+  // Pointer offsets for cublas batched gemms.
+  const int mha_k_offset_;
+  const int mha_q_offset_;
+  const int mha_buffer1_offset_;
+  const int mha_v_offset_;
+  const int mha_buffer2_offset_;
+
+  // RPE pointer offsets.
+  const int mha_q_rpe_offset_;
+  const int mha_k_rpe_offset_;
+  const int mha_v_rpe_offset_;
+  const int mha_rpe_q_offset_;
+  const int mha_rpe_k_offset_;
+  const int mha_rpe_v_offset_;
+  const int mha_rpe_buffer1_offset_;
 };
 
 // The Attention policy head implementation
@@ -428,7 +444,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
   DataType *ip_pol_w_, *ip_pol_b_;    // "embedding" in policy attention
   DataType *ip2_pol_w_, *ip2_pol_b_;  // "wq" in policy attention
   DataType *ip3_pol_w_, *ip3_pol_b_;  // "wk" in policy attention
-  DataType *ip4_pol_w_;               // "ppo" in policy attention
+  DataType* ip4_pol_w_;               // "ppo" in policy attention
 
   DataType *wqk_w_, *wqk_b_;  // allocation containing both "wq" and "wq"
 
@@ -494,16 +510,16 @@ class AttentionBody : public BaseLayer<DataType> {
       *ip_emb_pre_b_;               // input position preprocessing weights.
   DataType *ip_emb_w_, *ip_emb_b_;  // "embedding" layer in net body
   DataType *ip_emb_ln_g_,
-      *ip_emb_ln_b_;                       // input embedding layernorm gamma and beta
+      *ip_emb_ln_b_;  // input embedding layernorm gamma and beta
   DataType *ip_mult_gate_, *ip_add_gate_;  // input gating
   DataType *ip_emb_ffn_d1_w_,
-      *ip_emb_ffn_d1_b_;                   // input embedding FFN dense1 weights
+      *ip_emb_ffn_d1_b_;  // input embedding FFN dense1 weights
   DataType *ip_emb_ffn_d2_w_,
-      *ip_emb_ffn_d2_b_;      // input embedding FFN dense2 weights
+      *ip_emb_ffn_d2_b_;  // input embedding FFN dense2 weights
   DataType *ip_emb_ffn_ln_g_,
       *ip_emb_ffn_ln_b_;      // input embedding FFN layernorm gamma and beta
-  DataType *smolgen_global_;  // global smolgen weights for all encoder layers
-  DataType *pos_encoding_;
+  DataType* smolgen_global_;  // global smolgen weights for all encoder layers
+  DataType* pos_encoding_;
   int embedding_dense_size_;
   int embedding_op_size_;
   int embedding_ffn_size_;

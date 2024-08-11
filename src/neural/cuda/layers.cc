@@ -39,7 +39,27 @@
 
 namespace lczero {
 
-#if 0
+#if 1
+// function to calculate mean
+static float mean(float arr[], int n) {
+  float sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += arr[i];
+  }
+  return sum / n;
+}
+
+// function to calculate standard deviation
+static float stdDev(float arr[], int n) {
+  float m = mean(arr, n);  // get the mean
+  float var = 0;           // initialize variance
+  for (int i = 0; i < n; i++) {
+    var += pow(arr[i] - m, 2);  // add the squared difference from mean
+  }
+  var /= n;          // divide by number of elements
+  return sqrt(var);  // return the square root of variance
+}
+
 // debug code to dump allocation in GPU memory
 template <typename T>
 void dumpTensor(T* memory, int elements, const char* message, int lines = -1,
@@ -52,9 +72,10 @@ void dumpTensor(T* memory, int elements, const char* message, int lines = -1,
   cudaMemcpy(temp, memory, bytes, cudaMemcpyDeviceToHost);
   float maxval = -std::numeric_limits<float>::max();
   float minval = std::numeric_limits<float>::max();
-  int nans = 0;
-  int nanss[10]{};
+  int cnans = 0;
+  int nans[10]{};
 
+  std::vector<float> fpArr(elements);
   for (int i = 0; i < elements; i++) {
     float val;
     if (fp16) {
@@ -64,12 +85,13 @@ void dumpTensor(T* memory, int elements, const char* message, int lines = -1,
       float* arr = (float*)temp;
       val = arr[i];
     }
+    fpArr[i] = val;
     maxval = std::max(maxval, val);
     minval = std::min(minval, val);
 
     if (std::isnan(val)) {
-      if (nans < 10) nanss[nans] = i;
-      nans++;
+      if (cnans < 10) nans[cnans] = i;
+      cnans++;
     }
 
     if ((i >= start && (i < start + lines || lines == -1)) ||
@@ -85,11 +107,18 @@ void dumpTensor(T* memory, int elements, const char* message, int lines = -1,
   if (minval == std::numeric_limits<float>::max())
     minval = std::numeric_limits<double>::quiet_NaN();
 
-  printf("Max: %.6f, Min: %.6f, NaNs: %i of %i", maxval, minval, nans,
-         elements);
-  printf("\nNaN indices: ");
-  for (int i = 0; i < nans && i < 10; i++) printf("%i ", nanss[i]);
-  if (nans > 10) printf("......");
+  float avg = mean(&fpArr[0], elements);
+  float stddev = stdDev(&fpArr[0], elements);
+  printf(
+      "Max: %.6f, Min: %.6f, Mean: %.6f, StdDev: %.6f\n"
+      "NaNs: %i of %i",
+      maxval, minval, avg, stddev, cnans, elements);
+
+  if (cnans > 0) {
+    printf("\nNaN indices: ");
+    for (int i = 0; i < cnans && i < 10; i++) printf("%i ", nans[i]);
+    if (cnans > 10) printf("......");
+  }
   printf("\n");
 }
 #endif
@@ -1555,7 +1584,19 @@ EncoderBlock<DataType>::EncoderBlock(
       has_smolgen_(cpu_weights.mha.has_smolgen),
       smolgen_activation_(smolgen_act),
       ffn_activation_(ffn_act),
-      max_batch_size_(max_batch_size) {
+      max_batch_size_(max_batch_size),
+      mha_k_offset_(0),
+      mha_q_offset_(heads * max_batch_size),
+      mha_buffer1_offset_(2 * heads * max_batch_size),
+      mha_v_offset_(3 * heads * max_batch_size),
+      mha_buffer2_offset_(4 * heads * max_batch_size),
+      mha_q_rpe_offset_(5 * heads * max_batch_size),
+      mha_k_rpe_offset_(69 * heads * max_batch_size),
+      mha_v_rpe_offset_(133 * heads * max_batch_size),
+      mha_rpe_q_offset_(197 * heads * max_batch_size),
+      mha_rpe_k_offset_(261 * heads * max_batch_size),
+      mha_rpe_v_offset_(325 * heads * max_batch_size),
+      mha_rpe_buffer1_offset_(389 * heads * max_batch_size) {
   mha_q_size_ = cpu_weights.mha.q_b.size();
   mha_k_size_ = cpu_weights.mha.k_b.size();
   mha_v_size_ = cpu_weights.mha.v_b.size();
@@ -1684,12 +1725,11 @@ EncoderBlock<DataType>::EncoderBlock(
                             rpe_scratch, mha_q_size_, 0.0f, (DataType*)scratch,
                             4096);
 
-      // Permute RPE Q weights: [D, H, Q, K] -> [H, Q, D, K]
-      // Permute RPE Q weights: [D, H, Q, K] -> [H, Q, K, D]
+      // Permute RPE Q weights: [D, H, Q, K] -> [Q, H, K, D]
       ReportCUDAErrors(
           cudaMalloc(&mha_rpe_q, mha_q_size_ * 4096 * sizeof(DataType)));
       permuteTensor((DataType*)mha_rpe_q, (const DataType*)scratch, depth,
-                    heads, 64, 64, 1, 2, 3, 0, 0);
+                    heads, 64, 64, 2, 1, 3, 0, 0);
     }
     if (mha_rpe_k_size_ > 0) {
       allocAndUpload<DataType>(&rpe_scratch, cpu_weights.mha.rpe_k, scratch);
@@ -1721,7 +1761,7 @@ EncoderBlock<DataType>::EncoderBlock(
       permuteTensor((DataType*)mha_rpe_v, (const DataType*)scratch, depth,
                     heads, 64, 64, 1, 2, 0, 3, 0);
     }
-    cublasDestroy(tmp_cublas);
+    ReportCUBLASErrors(cublasDestroy(tmp_cublas));
   }
 }
 
@@ -1843,30 +1883,48 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // shape(k)[-1] = depth
   float factor = 1.0f / sqrt((float)depth);
 
+  // printf("We are here\n");
+  // exit(0);
+
   // matmul_qk = tf.matmul(q, k, transpose_b=True)
   {
     if (*offset_pointers == nullptr) {
-      std::vector<DataType*> offsets(encoder_heads_ * max_batch_size_ * 5);
+      const int offsets_size = (64 * 7 + 5) * encoder_heads_ * max_batch_size_;
+      std::vector<DataType*> offsets(offsets_size);
+      // Offsets for Q, K, V weights and activations buffers.
       for (int i = 0; i < encoder_heads_ * max_batch_size_; i++) {
         int h = i % encoder_heads_;
         int n = i / encoder_heads_;
-        offsets[i] = mha_k + h * depth + 64 * d_model * n;
-        offsets[i + encoder_heads_ * max_batch_size_] =
-            mha_q + h * depth + 64 * d_model * n;
-        offsets[i + 2 * encoder_heads_ * max_batch_size_] =
-            buffer1 + i * 64 * 64;
-        offsets[i + 3 * encoder_heads_ * max_batch_size_] =
-            mha_v + h * depth + 64 * d_model * n;
-        offsets[i + 4 * encoder_heads_ * max_batch_size_] =
+        offsets[i + mha_k_offset_] = mha_k + h * depth + 64 * d_model * n;
+        offsets[i + mha_q_offset_] = mha_q + h * depth + 64 * d_model * n;
+        offsets[i + mha_buffer1_offset_] = buffer1 + i * 64 * 64;
+        offsets[i + mha_v_offset_] = mha_v + h * depth + 64 * d_model * n;
+        offsets[i + mha_buffer2_offset_] =
             buffer2 + h * depth + 64 * d_model * n;
       }
-      ReportCUDAErrors(
-          cudaMalloc((void**)offset_pointers,
-                     encoder_heads_ * max_batch_size_ * 5 * sizeof(DataType*)));
-      ReportCUDAErrors(
-          cudaMemcpy(*offset_pointers, offsets.data(),
-                     encoder_heads_ * max_batch_size_ * 5 * sizeof(DataType*),
-                     cudaMemcpyHostToDevice));
+      // Offsets for RPE weights and activations buffers.
+      const int QH = encoder_heads_ * 64;
+      for (int i = 0; i < encoder_heads_ * 64 * max_batch_size_; i++) {
+        int qh = i % QH;
+        int h = i % encoder_heads_;
+        int q = i / encoder_heads_;
+        int n = q / 64;
+        q = q % 64;
+        int j = ((n * encoder_heads_) + h) * 64 + q;
+        offsets[i + mha_q_rpe_offset_] = mha_q + i * depth;
+        offsets[i + mha_k_rpe_offset_] = mha_k + i * depth;
+        offsets[i + mha_v_rpe_offset_] = mha_v + i * depth;
+        offsets[i + mha_rpe_q_offset_] = mha_rpe_q + qh * depth * 64;
+        offsets[i + mha_rpe_k_offset_] = mha_rpe_k + qh * depth * 64;
+        offsets[i + mha_rpe_buffer1_offset_] = buffer1 + j * 64;
+        offsets[i + mha_rpe_v_offset_] = mha_rpe_v + qh * depth * 64; // @todo yet to be analysed.
+      }
+
+      ReportCUDAErrors(cudaMalloc((void**)offset_pointers,
+                                  offsets_size * sizeof(DataType*)));
+      ReportCUDAErrors(cudaMemcpy(*offset_pointers, offsets.data(),
+                                  offsets_size * sizeof(DataType*),
+                                  cudaMemcpyHostToDevice));
     }
     cublasXGemmBatched<DataType>(
         cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64 /*M*/, 64 /*N*/,
@@ -1874,19 +1932,18 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                       // transform
         mha_rpe_q_size_ > 0 || mha_rpe_k_size_ > 0
             ? 1.0f
-            : factor,      // in RPE nets, scaling is done after RPE logits
-        *offset_pointers,  // mha_k + offset /*A*/,
-        d_model /*LDA*/,   // (d_model = depth * encoder_heads_) to skip over
-                           // other "depth" slices / heads
+            : factor,  // in RPE nets, scaling is done after RPE logits
+        *offset_pointers + mha_k_offset_,  // mha_k + offset /*A*/,
+        d_model /*LDA*/,  // (d_model = depth * encoder_heads_) to skip over
+                          // other "depth" slices / heads
         // 64 * d_model,     /*strideA*/
-        *offset_pointers +
-            encoder_heads_ * max_batch_size_,  // mha_q + offset /*B*/,
+        *offset_pointers + mha_q_offset_,  // mha_q + offset /*B*/,
         d_model /*LDB*/,  // to skip over other other "depth" slices / heads
         // 64 * d_model,     /*strideB*/
         0.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               2,  // buffer1 + outOffset /*C*/,  // output
-                                   // (matmul_qk) goes to buffer1
+        *offset_pointers +
+            mha_buffer1_offset_,  // buffer1 + outOffset /*C*/,  // output
+                                  // (matmul_qk) goes to buffer1
         64 /*LDC*/,
         // 64 * 64 /*strideC*/,
         N * encoder_heads_);
@@ -1897,21 +1954,66 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     if (mha_rpe_q_size_ > 0) {
       // Matrix-vector multiplication for query x rpe_q
       // Note: mha_q here is not yet transposed, so shape is still BQHD.
-      // mha_q @ rpe_q: [B, Q, H, D] x [D, H, Q, K]
-      // Kernel performs the required transpositions.
+      // rpe_q weights has been transposed to QHKD
+      // mha_q @ rpe_q: [B, Q, H, D] x [Q, H, K, D]
       float outScale = mha_rpe_k_size_ == 0 ? factor : 1.0f;
+#if 0
+      // Kernel performs the required transpositions.
       multiplyRPEAttentionLogits<DataType>(mha_q, mha_rpe_q, buffer1, buffer1,
                                            N, encoder_heads_, 64, 64, depth,
                                            outScale, 0, stream);
+      // dumpTensor((DataType*)buffer1, 4096 * d_model * N, "from kernel", 8192);
+      // exit(0);
+#else
+      {
+        // mha_q:     [B, Q, H, D] -> expand to [B, Q, H, (1, D)]
+        // mha_rpe_q: [Q, H, K, D] -> expand to [1, Q, H, (K, D)]
+        // buffer2:   [B, Q, H, K]
+        const int m = 1;
+        const int n = 64;
+        const int k = depth;
+        cublasXGemmBatched<DataType>(
+            cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, outScale,
+            *offset_pointers + mha_q_rpe_offset_,  // mha_q + offset /*A*/,
+            k /*LDA*/,                             // BQHD -> BQH(1D)
+            *offset_pointers + mha_rpe_q_offset_,  // mha_rpe_q + offset /*B*/,
+            n /*LDB*/,                             // QHKD -> 1QH(KD)
+            outScale,   // alpha & beta same value so we have a scaled output.
+            *offset_pointers +
+                mha_rpe_buffer1_offset_,  // buffer1 + offset /*C*/,
+                                          // output (matmul_qk) goes to buffer1
+            64 /*LDC*/, N * encoder_heads_ * 64);
+      }
+#endif
+      // dumpTensor((DataType*)buffer1, 4096 * d_model * N, "from gemm", 8192);
+      // exit(0);
     }
     if (mha_rpe_k_size_ > 0) {
       // Matrix-vector multiplication for key x rpe_k
       // Note: mha_k here is not yet transposed, so shape is still BKHD.
-      // mha_k @ rpe_k: [B, K, H, D] x [D, H, Q, K]
+      // rpe_k weights has been transposed to QHKD
+      // mha_k @ rpe_k: [B, K, H, D] x [Q, H, K, D]
       // Kernel performs the required transpositions.
+
+#if 1
       multiplyRPEAttentionLogits<DataType>(mha_k, mha_rpe_k, buffer1, buffer1,
                                            N, encoder_heads_, 64, 64, depth,
                                            factor, 1, stream);
+#else
+      {
+        // mha_k:     [B, K, H, D] -> expand to [B, K, H, (1, D)]
+        // mha_rpe_k: [K, H, Q, D] -> expand to [1, K, H, (Q, D)]
+        // buffer1:   [B, K, H, Q]
+        const int m = 1;
+        const int n = 64;
+        const int k = depth;
+        cublasXGemmStridedBatched<DataType>(
+            cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, 1.0f, mha_k, k, m * k,
+            mha_rpe_k, n, n * k, 0.0f, buffer2, m, m * n, 64 * encoder_heads_);
+      }
+// dumpTensor((DataType*)buffer1, 4096 * d_model * N, "from gemm", 0);
+// exit(0);
+#endif
     }
   }
   // attention_weights = tf.nn.softmax(scaled_attention_logits, axis = -1)
@@ -1920,25 +2022,28 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     // Add smolgen weights to the scaled matmul_qk attention logits before
     // softmax.
     Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, stream);
+    //   Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2,
+    //           (const DataType*)nullptr, false, stream);
+    // } else if (mha_q_size_ > 0 || mha_k_size_ > 0) {
+    //   Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2,
+    //           (const DataType*)nullptr, true, stream);
   } else {
     Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
             (const DataType*)nullptr, stream);
+    // (const DataType*)nullptr, (const DataType*)nullptr, false, stream);
   }
 
   {
     cublasXGemmBatched<DataType>(
         cublas, CUBLAS_OP_N, CUBLAS_OP_N, depth /*M*/, 64 /*N*/, 64 /*K*/, 1.0f,
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               3,  // mha_v + offset /*A*/,  // "v" matrix
-        d_model /*LDA*/,           // to skip over other "depth" slices / heads
+        *offset_pointers + mha_v_offset_,  // mha_v + offset /*A*/,  // "v" matrix
+        d_model /*LDA*/,    // to skip over other "depth" slices / heads
         // 64 * d_model,          /*strideA*/
-        *offset_pointers + encoder_heads_ * max_batch_size_ *
-                               2,  // buffer1 + weightsOffset /*B*/,
-        64 /*LDB*/,                // 64 * 64, /*strideB*/
+        *offset_pointers + mha_buffer1_offset_,  // buffer1 + offset /*B*/,
+        64 /*LDB*/,                              // 64 * 64, /*strideB*/
         0.0f,
-        *offset_pointers +
-            encoder_heads_ * max_batch_size_ *
-                4,  // buffer2 + offset /*C*/,  // output goes to buffer2
+        *offset_pointers + mha_buffer2_offset_,  // buffer2 + offset /*C*/,  //
+                                                 // output goes to buffer2
         d_model /*LDC*/,
         // 64 * d_model /*strideC*/,
         N * encoder_heads_);

@@ -134,6 +134,8 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2,
              cudaStream_t stream);
+// void Softmax(int N, int C, T* output, const T* input, const T* skip1,
+//              const T* skip2, bool rpe, cudaStream_t stream);
 
 template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
