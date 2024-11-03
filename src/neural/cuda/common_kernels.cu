@@ -114,7 +114,7 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
   int tensorIndex = batch * N * C + n * C + c;
 
   float val[4];
-  float b[4];
+  float b[4] = {0, 0, 0, 0};
 
   // Load from memory
   const bool fp16 = std::is_same<half, T>::value;
@@ -124,12 +124,14 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 #pragma unroll
     for (int i = 0; i < 4; i++) val[i] = (float)inp[i];
 
-    copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    if (bias != nullptr) {
+      copyAs<uint2>(&inp[0], &bias[biasIndex]);
 #pragma unroll
-    for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+      for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+    }
   } else {
     copyAs<uint4>(&val[0], &input[tensorIndex]);
-    copyAs<uint4>(&b[0], &bias[biasIndex]);
+    if (bias != nullptr) copyAs<uint4>(&b[0], &bias[biasIndex]);
   }
 
   // Perform bias add and activation
@@ -213,7 +215,7 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
   int tensorIndex = batch * Nstride * C + n * C + c;
 
   float val[4];
-  float b[4];
+  float b[4] = {0, 0, 0, 0};
 
   // Load from memory
   const bool fp16 = std::is_same<half, T>::value;
@@ -223,12 +225,14 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 #pragma unroll
     for (int i = 0; i < 4; i++) val[i] = (float)inp[i];
 
-    copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    if (bias != nullptr) {
+      copyAs<uint2>(&inp[0], &bias[biasIndex]);
 #pragma unroll
-    for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+      for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+    }
   } else {
     copyAs<uint4>(&val[0], &input[tensorIndex]);
-    copyAs<uint4>(&b[0], &bias[biasIndex]);
+    if (bias != nullptr) copyAs<uint4>(&b[0], &bias[biasIndex]);
   }
 
   // Perform bias add and activation
@@ -1224,7 +1228,7 @@ __global__ void rms_norm_kernel(int N, int C, T* output, const T* input,
 
   s = shared_sum_for_layer_norm(s);
   float mean = s / C;
-  float factor = sqrt(mean + ep);
+  float factor = 1.0f / sqrt(mean + ep);
 
   if (!oobThread) {
     // Load from memory (16 elements a time)

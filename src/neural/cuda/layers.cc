@@ -1495,21 +1495,33 @@ EncoderBlock<DataType>::EncoderBlock(
       smolgen_activation_(smolgen_act),
       ffn_activation_(ffn_act),
       max_batch_size_(max_batch_size) {
-  mha_q_size_ = cpu_weights.mha.q_b.size();
-  mha_k_size_ = cpu_weights.mha.k_b.size();
-  mha_v_size_ = cpu_weights.mha.v_b.size();
+  mha_q_size_ = cpu_weights.mha.q_w.size() / embedding_op_size_;
+  mha_k_size_ = cpu_weights.mha.k_b.size() / embedding_op_size_;
+  mha_v_size_ = cpu_weights.mha.v_b.size() / embedding_op_size_;
   mha_dense_size_ = cpu_weights.mha.dense_b.size();
   ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
   ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
 
   allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch);
-  allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch);
+  if (cpu_weights.mha.q_b.size() == 0) {
+    mha_q_b = nullptr;
+  } else {
+    allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch);
+  }
 
   allocAndUpload<DataType>(&mha_k_w, cpu_weights.mha.k_w, scratch);
-  allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch);
+  if (cpu_weights.mha.k_b.size() == 0) {
+    mha_k_b = nullptr;
+  } else {
+    allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch);
+  }
 
   allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch);
-  allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
+  if (cpu_weights.mha.v_b.size() == 0) {
+    mha_v_b = nullptr;
+  } else {
+    allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
+  }
 
   // big allocation to hold qkv weights one after the other
   {
@@ -1523,22 +1535,31 @@ EncoderBlock<DataType>::EncoderBlock(
     ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3,
                                 cudaMemcpyDeviceToDevice));
 
-    elements = cpu_weights.mha.q_b.size();
-    size = elements * sizeof(DataType) * 3;
-    ReportCUDAErrors(cudaMalloc(&mha_qkv_b, size));
-    ReportCUDAErrors(
-        cudaMemcpy(mha_qkv_b, mha_q_b, size / 3, cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements, mha_k_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
+    if (cpu_weights.mha.q_b.size() == 0 || cpu_weights.mha.k_b.size() == 0 ||
+        cpu_weights.mha.v_b.size() == 0) {
+      mha_qkv_b = nullptr;
+    } else {
+      elements = cpu_weights.mha.q_b.size();
+      size = elements * sizeof(DataType) * 3;
+      ReportCUDAErrors(cudaMalloc(&mha_qkv_b, size));
+      ReportCUDAErrors(
+          cudaMemcpy(mha_qkv_b, mha_q_b, size / 3, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements, mha_k_b, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+    }
   }
 
   allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch);
   allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch);
 
   allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch);
-  allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch);
+  if (cpu_weights.ln1_betas.size() == 0) {
+    ln1_betas = nullptr;
+  } else {
+    allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch);
+  }
 
   allocAndUpload<DataType>(&ffn_dense1_w, cpu_weights.ffn.dense1_w, scratch);
   allocAndUpload<DataType>(&ffn_dense1_b, cpu_weights.ffn.dense1_b, scratch);
@@ -1547,7 +1568,11 @@ EncoderBlock<DataType>::EncoderBlock(
   allocAndUpload<DataType>(&ffn_dense2_b, cpu_weights.ffn.dense2_b, scratch);
 
   allocAndUpload<DataType>(&ln2_gammas, cpu_weights.ln2_gammas, scratch);
-  allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch);
+  if (cpu_weights.ln2_betas.size() == 0) {
+    ln2_betas = nullptr;
+  } else {
+    allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch);
+  }
 
   // Smolgen weights.
   if (has_smolgen_) {
@@ -1569,12 +1594,20 @@ EncoderBlock<DataType>::EncoderBlock(
 
     allocAndUpload<DataType>(&smol_ln1_gammas,
                              cpu_weights.mha.smolgen.ln1_gammas, scratch);
-    allocAndUpload<DataType>(&smol_ln1_betas, cpu_weights.mha.smolgen.ln1_betas,
-                             scratch);
+    if (cpu_weights.mha.smolgen.ln1_betas.size() == 0) {
+      smol_ln1_betas = nullptr;
+    } else {
+      allocAndUpload<DataType>(&smol_ln1_betas,
+                               cpu_weights.mha.smolgen.ln1_betas, scratch);
+    }
     allocAndUpload<DataType>(&smol_ln2_gammas,
                              cpu_weights.mha.smolgen.ln2_gammas, scratch);
-    allocAndUpload<DataType>(&smol_ln2_betas, cpu_weights.mha.smolgen.ln2_betas,
-                             scratch);
+    if (cpu_weights.mha.smolgen.ln2_betas.size() == 0) {
+      smol_ln2_betas = nullptr;
+    } else {
+      allocAndUpload<DataType>(&smol_ln2_betas,
+                               cpu_weights.mha.smolgen.ln2_betas, scratch);
+    }
 
     // GPU memory already allocated in AttentionBody.
     smol_global = smolgen_global_scratch;
@@ -1681,9 +1714,15 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                             (const DataType*)smol_dense1_w, num_inputs, scratch,
                             num_inputs, 0.0f, buffer1, num_outputs);
 
-      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
-                          (DataType*)nullptr, smol_ln1_gammas, smol_ln1_betas,
-                          1e-3, 1.0, smolgen_activation_, stream);
+      if (smol_ln1_betas != nullptr) {
+        LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
+                            (DataType*)nullptr, smol_ln1_gammas, smol_ln1_betas,
+                            1e-3, 1.0, smolgen_activation_, stream);
+      } else {
+        RmsNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
+                          (DataType*)nullptr, smol_ln1_gammas, 1e-5, 1.0,
+                          smolgen_activation_, stream);
+      }
     }
 
     {
@@ -1697,10 +1736,15 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                             batch, num_inputs, 1.0f,
                             (const DataType*)smol_dense2_w, num_inputs, scratch,
                             num_inputs, 0.0f, buffer1, num_outputs);
-
-      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
-                          (DataType*)nullptr, smol_ln2_gammas, smol_ln2_betas,
-                          1e-3, 1.0, smolgen_activation_, stream);
+      if (smol_ln2_betas != nullptr) {
+        LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
+                            (DataType*)nullptr, smol_ln2_gammas, smol_ln2_betas,
+                            1e-3, 1.0, smolgen_activation_, stream);
+      } else {
+        RmsNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
+                          (DataType*)nullptr, smol_ln2_gammas, 1e-5, 1.0,
+                          smolgen_activation_, stream);
+      }
     }
 
     {
@@ -1850,9 +1894,15 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
   // LN1: skip connection and layer normalization (also bias add of prev gemm)
   // buffer1/in_out_tensor -> scratch
-  LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
-                      in_out_tensor, ln1_gammas, ln1_betas, default_eps_,
-                      alpha_, ACTIVATION_NONE, stream);
+  if (ln1_betas != nullptr) {
+    LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1,
+                        mha_dense_b, in_out_tensor, ln1_gammas, ln1_betas,
+                        default_eps_, alpha_, ACTIVATION_NONE, stream);
+  } else {
+    RmsNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
+                      in_out_tensor, ln1_gammas, 1e-5, alpha_, ACTIVATION_NONE,
+                      stream);
+  }
 
   // #FFN dense 1, scratch -> in_out_tensor
   {
@@ -1878,9 +1928,15 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
   // LN2: skip connection and layer normilization (also bias add of prev gemm)
   // buffer1/scratch -> in_out_tensor
-  LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
-                      ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
-                      default_eps_, alpha_, ACTIVATION_NONE, stream);
+  if (ln2_betas != nullptr) {
+    LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
+                        ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
+                        default_eps_, alpha_, ACTIVATION_NONE, stream);
+  } else {
+    RmsNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
+                      ffn_dense2_b, scratch, ln2_gammas, 1e-5, alpha_,
+                      ACTIVATION_NONE, stream);
+  }
 }
 
 template <typename DataType>
@@ -2065,7 +2121,11 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
     allocAndUpload<DataType>(&ip_emb_pre_b_, weights.ip_emb_preproc_b, scratch);
 
     allocAndUpload<DataType>(&ip_emb_ln_g_, weights.ip_emb_ln_gammas, scratch);
-    allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+    if (weights.ip_emb_ln_betas.size() == 0) {
+      ip_emb_ln_b_ = nullptr;
+    } else {
+      allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+    }
 
     allocAndUpload<DataType>(&ip_emb_ffn_d1_w_, weights.ip_emb_ffn.dense1_w,
                              scratch);
@@ -2079,8 +2139,12 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
 
     allocAndUpload<DataType>(&ip_emb_ffn_ln_g_, weights.ip_emb_ffn_ln_gammas,
                              scratch);
-    allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
-                             scratch);
+    if (weights.ip_emb_ffn_ln_betas.size() == 0) {
+      ip_emb_ffn_ln_b_ = nullptr;
+    } else {
+      allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
+                               scratch);
+    }
 
     // 12 is the number of input channels used for the input encoding.
     embedding_dense_size_ = weights.ip_emb_preproc_b.size() / 64;
@@ -2225,10 +2289,16 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                             num_inputs, temp, num_inputs, 0.0f, embedding,
                             num_outputs);
       // embedding layer norm with fused in bias add of previous gemm.
-      LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
-                          ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
-                          ip_emb_ln_b_, 1e-3, 1.0,
-                          activations_.default_activation, stream);
+      if (ip_emb_ln_b_ != nullptr) {
+        LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
+                            ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
+                            ip_emb_ln_b_, 1e-3, 1.0,
+                            activations_.default_activation, stream);
+      } else {
+        RmsNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
+                          ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_, 1e-5,
+                          1.0, activations_.default_activation, stream);
+      }
     }
 
     // Input gating
@@ -2260,10 +2330,16 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       // Embedding LN: skip connection and layer normilization (also bias add of
       // prev gemm) buffer2 -> embedding
       float alpha = (float)pow(2. * encoder_weights_.size(), -0.25);
-      LayerNorm<DataType>(N * 64, embedding_ffn_size_, embedding, buffer2,
-                          ip_emb_ffn_d2_b_, temp, ip_emb_ffn_ln_g_,
-                          ip_emb_ffn_ln_b_, 1e-3, alpha, ACTIVATION_NONE,
-                          stream);
+      if (ip_emb_ffn_ln_b_ != nullptr) {
+        LayerNorm<DataType>(N * 64, embedding_ffn_size_, embedding, buffer2,
+                            ip_emb_ffn_d2_b_, temp, ip_emb_ffn_ln_g_,
+                            ip_emb_ffn_ln_b_, 1e-3, alpha, ACTIVATION_NONE,
+                            stream);
+      } else {
+        RmsNorm<DataType>(N * 64, embedding_ffn_size_, embedding, buffer2,
+                          ip_emb_ffn_d2_b_, temp, ip_emb_ffn_ln_g_, 1e-5, alpha,
+                          ACTIVATION_NONE, stream);
+      }
     }
 
   } else {
