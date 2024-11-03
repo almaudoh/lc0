@@ -956,7 +956,7 @@ __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
   return sum[threadIdx.z][0];
 }
 
-// Each thread processes 4 elements
+// Each thread processes 16 elements
 // 1. Perform Bias add, and skip add
 // 2. Perform layer norm (normalize across C dimension)
 template <typename T>
@@ -1117,7 +1117,7 @@ template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
                const T* skip, const T* gammas, const T* betas, float ep,
                float alpha, ActivationFunction act, cudaStream_t stream) {
-  // process 4 elements per thread to achieve close to peak memory bandwidth
+  // process 16 elements per thread to achieve close to peak memory bandwidth
   if (C % 16 != 0) throw Exception("unsupported filter size");
   if (C > 16384) throw Exception("unsupported filter size");
 
@@ -1132,6 +1132,161 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
 
   layer_norm_kernel<T><<<gridDim, blockDim, 0, stream>>>(
       N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+// Each thread processes 16 elements
+// 1. Perform Bias add, and skip add
+// 2. Perform rms norm (normalize across C dimension)
+template <typename T>
+__global__ void rms_norm_kernel(int N, int C, T* output, const T* input,
+                                const T* bias, const T* skip, const T* gammas,
+                                float ep, float alpha, ActivationFunction act) {
+  int n = blockIdx.x * blockDim.z + threadIdx.z;
+  if (n >= N) return;
+  int c = (threadIdx.y * 32 + threadIdx.x) * 16;
+  bool oobThread = c >= C;
+
+  int biasIndex = c;
+  int tensorIndex = n * C + c;
+
+  float val[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  float oth[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+  const bool fp16 = std::is_same<half, T>::value;
+  if (!oobThread) {
+    // Load from memory (16 elements a time)
+    if (fp16) {
+      half inp[8];
+      copyAs<uint4>(&inp[0], &input[tensorIndex]);
+      for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
+      copyAs<uint4>(&inp[0], &input[tensorIndex + 8]);
+      for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
+
+      // Add bias if provided.
+      if (bias != nullptr) {
+        copyAs<uint4>(&inp[0], &bias[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<uint4>(&inp[0], &bias[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
+    } else {
+      copyAs<uint4>(&val[0], &input[tensorIndex]);
+      copyAs<uint4>(&val[4], &input[tensorIndex + 4]);
+      copyAs<uint4>(&val[8], &input[tensorIndex + 8]);
+      copyAs<uint4>(&val[12], &input[tensorIndex + 12]);
+
+      // Add bias if provided.
+      if (bias != nullptr) {
+        copyAs<uint4>(&oth[0], &bias[biasIndex]);
+        copyAs<uint4>(&oth[4], &bias[biasIndex + 4]);
+        copyAs<uint4>(&oth[8], &bias[biasIndex + 8]);
+        copyAs<uint4>(&oth[12], &bias[biasIndex + 12]);
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
+    }
+  }
+
+  if (!oobThread) {
+    if (skip != nullptr) {
+      // Load from memory (16 elements a time)
+      if (fp16) {
+        half inp[8];
+        copyAs<uint4>(&inp[0], &skip[tensorIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<uint4>(&inp[0], &skip[tensorIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        copyAs<uint4>(&oth[0], &skip[tensorIndex]);
+        copyAs<uint4>(&oth[4], &skip[tensorIndex + 4]);
+        copyAs<uint4>(&oth[8], &skip[tensorIndex + 8]);
+        copyAs<uint4>(&oth[12], &skip[tensorIndex + 12]);
+      }
+    }
+  }
+
+  // 1. Compute root of mean of squares factor.
+  float s = 0;
+  if (!oobThread)
+    if (skip != nullptr) {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha + oth[i];
+        s += val[i] * val[i];
+      }
+    } else {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha;
+        s += val[i] * val[i];
+      }
+    }
+
+  s = shared_sum_for_layer_norm(s);
+  float mean = s / C;
+  float factor = sqrt(mean + ep);
+
+  if (!oobThread) {
+    // Load from memory (16 elements a time)
+    if (fp16) {
+      half inp[8];
+      copyAs<uint4>(&inp[0], &gammas[biasIndex]);
+      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+      copyAs<uint4>(&inp[0], &gammas[biasIndex + 8]);
+      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+    } else {
+      copyAs<uint4>(&oth[0], &gammas[biasIndex]);
+      copyAs<uint4>(&oth[4], &gammas[biasIndex + 4]);
+      copyAs<uint4>(&oth[8], &gammas[biasIndex + 8]);
+      copyAs<uint4>(&oth[12], &gammas[biasIndex + 12]);
+    }
+  }
+
+  // 2. Normalize
+  for (int i = 0; i < 16; i++) {
+    float op = val[i] * factor * oth[i];
+    val[i] = op;
+  }
+
+  // 3. Write to memory
+  if (!oobThread) {
+    if (fp16) {
+      half op[8];
+      for (int i = 0; i < 8; i++) op[i] = (half)val[i];
+      copyAs<uint4>(&output[tensorIndex], &op[0]);
+      for (int i = 0; i < 8; i++) op[i] = (half)val[i + 8];
+      copyAs<uint4>(&output[tensorIndex + 8], &op[0]);
+    } else {
+      copyAs<uint4>(&output[tensorIndex], &val[0]);
+      copyAs<uint4>(&output[tensorIndex + 4], &val[4]);
+      copyAs<uint4>(&output[tensorIndex + 8], &val[8]);
+      copyAs<uint4>(&output[tensorIndex + 12], &val[12]);
+    }
+  }
+}
+
+// add (optional) skip connection to input, and then perform RMS normalization
+// normalization is done across C dimension (i.e, squares and sums are taken
+// over elements in C dim)
+template <typename T>
+void RmsNorm(int N, int C, T* output, const T* input, const T* bias,
+             const T* skip, const T* gammas, float ep, float alpha,
+             ActivationFunction act, cudaStream_t stream) {
+  // process 16 elements per thread to achieve close to peak memory bandwidth
+  if (C % 16 != 0) throw Exception("unsupported filter size");
+  if (C > 16384) throw Exception("unsupported filter size");
+
+  dim3 blockDim, gridDim;
+  blockDim.x = 32;
+  blockDim.y = DivUp(C / 16, 32);
+  blockDim.z =
+      std::min(std::max(512 / (blockDim.x * blockDim.y), 1u), (unsigned int)N);
+  gridDim.x = DivUp(N, blockDim.z);
+  gridDim.y = 1;
+  gridDim.z = 1;
+
+  rms_norm_kernel<T><<<gridDim, blockDim, 0, stream>>>(
+      N, C, output, input, bias, skip, gammas, ep, alpha, act);
 
   ReportCUDAErrors(cudaGetLastError());
 }
@@ -1242,7 +1397,8 @@ __global__ void preprocess_for_attention_body_kernel(
   if (c >= input_size) {
     // concatenate from position encoding array
     if (is_pe_dense_embedding) {
-      op = (T)(encoding[n * 64 * encoding_size + hw * encoding_size + (c - input_size)]);
+      op = (T)(encoding[n * 64 * encoding_size + hw * encoding_size +
+                        (c - input_size)]);
     } else {
       op = (T)(encoding[64 * hw + (c - input_size)]);
     }
@@ -1553,6 +1709,15 @@ template void LayerNorm<float>(int N, int C, float* output, const float* input,
                                const float* gammas, const float* betas,
                                float ep, float alpha, ActivationFunction act,
                                cudaStream_t stream);
+
+template void RmsNorm<half>(int N, int C, half* output, const half* input,
+                            const half* bias, const half* skip,
+                            const half* gammas, float ep, float alpha,
+                            ActivationFunction act, cudaStream_t stream);
+template void RmsNorm<float>(int N, int C, float* output, const float* input,
+                             const float* bias, const float* skip,
+                             const float* gammas, float ep, float alpha,
+                             ActivationFunction act, cudaStream_t stream);
 
 template void ComputePromotionLogits<half>(int N, int C, half* output,
                                            const half* keys, const half* ppo,
