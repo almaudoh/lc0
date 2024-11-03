@@ -154,15 +154,26 @@ void MetalNetworkBuilder::build(int kInputPlanes, MultiHeadWeights& weights, Inp
                                              activation:defaultActivation
                                                   label:@"input/embedding"];
 
-        // Add layernorm for new nets.
+        // Add layer / rms norm for new nets.
         if (isPeDenseEmbedding) {
-            layer = [graph addLayerNormalizationWithParent:layer
-                                     scaledSecondaryTensor:nil
-                                                    gammas:&weights.ip_emb_ln_gammas[0]
-                                                     betas:&weights.ip_emb_ln_betas[0]
-                                                     alpha:1.0
-                                                   epsilon:1e-3
-                                                     label:@"input/embedding/ln"];
+            if (weights.ip_emb_ln_betas.size() > 0 && weights.ip_emb_ln_gammas.size() > 0) {
+                layer = [graph addLayerNormalizationWithParent:layer
+                                         scaledSecondaryTensor:nil
+                                                        gammas:&weights.ip_emb_ln_gammas[0]
+                                                         betas:&weights.ip_emb_ln_betas[0]
+                                                         alpha:1.0
+                                                       epsilon:1e-3
+                                                         label:@"input/embedding/ln"];
+            }
+            else if (weights.ip_emb_ln_gammas.size() > 0) {
+                layer = [graph addRmsNormalizationWithParent:layer
+                                       scaledSecondaryTensor:nil
+                                                      gammas:&weights.ip_emb_ln_gammas[0]
+                                                       alpha:1.0
+                                                     epsilon:1e-5
+                                                       label:@"input/embedding/rmsn"];
+            }
+
         }
 
         // # !!! input gate
@@ -200,14 +211,23 @@ void MetalNetworkBuilder::build(int kInputPlanes, MultiHeadWeights& weights, Inp
                                                activation:nil
                                                     label:@"input/embedding/ffn/dense2"];
 
-            // Skip connection + RMS Norm.
-            layer = [graph addLayerNormalizationWithParent:layer
-                                     scaledSecondaryTensor:ffn
-                                                    gammas:&weights.ip_emb_ffn_ln_gammas[0]
-                                                     betas:&weights.ip_emb_ffn_ln_betas[0]
-                                                     alpha:alpha
-                                                   epsilon:1e-3
-                                                     label:@"input/embedding/ffn_ln"];
+            // Skip connection + Layer / RMS Norm.
+            if (weights.ip_emb_ffn_ln_betas.size() > 0 && weights.ip_emb_ffn_ln_gammas.size() > 0) {
+                layer = [graph addLayerNormalizationWithParent:layer
+                                         scaledSecondaryTensor:ffn
+                                                        gammas:&weights.ip_emb_ffn_ln_gammas[0]
+                                                         betas:&weights.ip_emb_ffn_ln_betas[0]
+                                                         alpha:alpha
+                                                       epsilon:1e-3
+                                                         label:@"input/embedding/ffn_ln"];
+            } else if (weights.ip_emb_ffn_ln_gammas.size() > 0) {
+                layer = [graph addRmsNormalizationWithParent:layer
+                                       scaledSecondaryTensor:ffn
+                                                      gammas:&weights.ip_emb_ffn_ln_gammas[0]
+                                                       alpha:alpha
+                                                     epsilon:1e-5
+                                                       label:@"input/embedding/ffn_rmsn"];
+            }
         }
 
         // 2b. Attention body encoder layers.
@@ -220,7 +240,6 @@ void MetalNetworkBuilder::build(int kInputPlanes, MultiHeadWeights& weights, Inp
                                        ffnActivation:ffnActivation
                                                alpha:alpha
                                              epsilon:isPeDenseEmbedding ? 1e-3 : 1e-6
-                                            normtype:@"layernorm"
                                                label:[NSString stringWithFormat:@"encoder_%zu", i]];
         }
     }

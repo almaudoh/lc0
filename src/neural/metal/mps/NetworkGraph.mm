@@ -503,28 +503,39 @@ static const NSInteger kMinSubBatchSize = 20;
                                         ffnActivation:(NSString * __nonnull)ffnActivation
                                                 alpha:(float)alpha
                                               epsilon:(float)epsilon
-                                             normtype:(NSString * __nonnull)normtype
                                                 label:(NSString * __nonnull)label
 {
-    NSUInteger dModel = encoder.mha.q_b.size();
+    NSUInteger dModel = encoder.mha.q_w.size() / embeddingSize;
+    float * qbiases = nil;
+    if (encoder.mha.q_b.size() > 0) {
+        qbiases = encoder.mha.q_b.data();
+    }
     MPSGraphTensor * mhaQ = [self addFullyConnectedLayerWithParent:parent
-                                                    outputChannels:encoder.mha.q_b.size()
-                                                           weights:&encoder.mha.q_w[0]
-                                                            biases:&encoder.mha.q_b[0]
+                                                    outputChannels:dModel
+                                                           weights:encoder.mha.q_w.data()
+                                                            biases:qbiases
                                                         activation:nil
                                                              label:[NSString stringWithFormat:@"%@/mhaq/fc", label]];
 
+    float * kbiases = nil;
+    if (encoder.mha.k_b.size() > 0) {
+        kbiases = encoder.mha.k_b.data();
+    }
     MPSGraphTensor * mhaK = [self addFullyConnectedLayerWithParent:parent
-                                                    outputChannels:encoder.mha.k_b.size()
-                                                           weights:&encoder.mha.k_w[0]
-                                                            biases:&encoder.mha.k_b[0]
+                                                    outputChannels:dModel
+                                                           weights:encoder.mha.k_w.data()
+                                                            biases:kbiases
                                                         activation:nil
                                                              label:[NSString stringWithFormat:@"%@/mhak/fc", label]];
 
+    float * vbiases = nil;
+    if (encoder.mha.v_b.size() > 0) {
+        vbiases = encoder.mha.v_b.data();
+    }
     MPSGraphTensor * mhaV = [self addFullyConnectedLayerWithParent:parent
-                                                    outputChannels:encoder.mha.v_b.size()
-                                                           weights:&encoder.mha.v_w[0]
-                                                            biases:&encoder.mha.v_b[0]
+                                                    outputChannels:dModel
+                                                           weights:encoder.mha.v_w.data()
+                                                            biases:vbiases
                                                         activation:nil
                                                              label:[NSString stringWithFormat:@"%@/mhav/fc", label]];
 
@@ -545,9 +556,9 @@ static const NSInteger kMinSubBatchSize = 20;
                                       activation:nil
                                            label:[NSString stringWithFormat:@"%@/mha/fc", label]];
 
-    // Skip connection + Layer Norm 1.
+    // Skip connection + Layer / RMS Norm 1.
     MPSGraphTensor * enc;
-    if ([normtype isEqual:@"layernorm"]) {
+    if (encoder.ln1_betas.size() > 0 && encoder.ln1_gammas.size() > 0) {
         enc = [self addLayerNormalizationWithParent:parent
                               scaledSecondaryTensor:mha
                                              gammas:&encoder.ln1_gammas[0]
@@ -556,14 +567,16 @@ static const NSInteger kMinSubBatchSize = 20;
                                             epsilon:epsilon
                                               label:[NSString stringWithFormat:@"%@/ln1", label]];
     }
-    else if ([normtype isEqual:@"rmsnorm"]) {
+    else if (encoder.ln1_gammas.size() > 0) {
         enc = [self addRmsNormalizationWithParent:parent
                             scaledSecondaryTensor:mha
                                            gammas:&encoder.ln1_gammas[0]
                                             alpha:alpha
-                                            label:[NSString stringWithFormat:@"%@/ln1", label]];
+                                          epsilon:1e-5
+                                            label:[NSString stringWithFormat:@"%@/rmsn1", label]];
     }
-    else if ([normtype isEqual:@"skipfirst"]) {
+    else {
+        enc = mha;
         if (alpha != 1.0) {
             enc = [self constantWithScalar:alpha shape:@[@1] dataType:parent.dataType];
             enc = [self multiplicationWithPrimaryTensor:mha
@@ -573,10 +586,6 @@ static const NSInteger kMinSubBatchSize = 20;
         enc = [self additionWithPrimaryTensor:parent
                               secondaryTensor:enc
                                          name:[NSString stringWithFormat:@"%@/add", label]];
-    }
-    else {
-        [NSException raise:@"Invalid normalization type."
-                    format:@"Invalid normalization type specified: %@", normtype];
     }
 
     // Feedforward network (FFN).
@@ -594,8 +603,8 @@ static const NSInteger kMinSubBatchSize = 20;
                                       activation:nil
                                            label:[NSString stringWithFormat:@"%@/ffn2", label]];
 
-    // Skip connection + Layer Norm 2.
-    if ([normtype isEqual:@"layernorm"]) {
+    // Skip connection + Layer / RMS Norm 2.
+    if (encoder.ln2_betas.size() > 0 && encoder.ln2_gammas.size() > 0) {
         return [self addLayerNormalizationWithParent:enc
                                scaledSecondaryTensor:ffn
                                               gammas:&encoder.ln2_gammas[0]
@@ -604,16 +613,13 @@ static const NSInteger kMinSubBatchSize = 20;
                                              epsilon:epsilon
                                                label:[NSString stringWithFormat:@"%@/ln2", label]];
     }
-    else if ([normtype isEqual:@"rmsnorm"] || [normtype isEqual:@"skipfirst"]) {
-        enc = [self addRmsNormalizationWithParent:enc
-                            scaledSecondaryTensor:ffn
-                                           gammas:&encoder.ln2_gammas[0]
-                                            alpha:alpha
-                                            label:[NSString stringWithFormat:@"%@/ln1", label]];
-    }
-    else {
-        [NSException raise:@"Invalid normalization type."
-                    format:@"Invalid normalization type specified: %@", normtype];
+    else if (encoder.ln2_gammas.size() > 0) {
+        return [self addRmsNormalizationWithParent:enc
+                             scaledSecondaryTensor:ffn
+                                            gammas:&encoder.ln2_gammas[0]
+                                             alpha:alpha
+                                           epsilon:1e-5
+                                             label:[NSString stringWithFormat:@"%@/rmsn2", label]];
     }
 }
 
@@ -681,6 +687,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                     scaledSecondaryTensor:(MPSGraphTensor * __nullable)secondary
                                                    gammas:(float * __nonnull)gammas
                                                     alpha:(float)alpha
+                                                  epsilon:(float)epsilon
                                                     label:(NSString * __nonnull)label
 {
     if (secondary != nil) {
@@ -707,6 +714,11 @@ static const NSInteger kMinSubBatchSize = 20;
                            axes:@[@(axis)]
                            name:[NSString stringWithFormat:@"%@/mean", label]];
 
+    MPSGraphTensor * epsTensor = [self constantWithScalar:epsilon shape:@[@1] dataType:parent.dataType];
+    factor = [self additionWithPrimaryTensor:factor
+                             secondaryTensor:epsTensor
+                                        name:[NSString stringWithFormat:@"%@/epsilon", label]];
+
     factor = [self squareRootWithTensor:factor
                                    name:[NSString stringWithFormat:@"%@/sqrt", label]];
 
@@ -719,9 +731,9 @@ static const NSInteger kMinSubBatchSize = 20;
                                                  dataType:MPSDataTypeFloat32
                                                      name:[NSString stringWithFormat:@"%@/gamma", label]];
 
-    factor = [self multiplicationWithPrimaryTensor:factor
-                                   secondaryTensor:gammaTensor
-                                              name:[NSString stringWithFormat:@"%@/multiply2", label]];
+    factor = [self divisionWithPrimaryTensor:gammaTensor
+                                   secondaryTensor:factor
+                                              name:[NSString stringWithFormat:@"%@/divideß", label]];
 
     return [self multiplicationWithPrimaryTensor:parent
                                  secondaryTensor:factor
@@ -793,7 +805,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                           axis:1
                                           name:[NSString stringWithFormat:@"%@/smolgen/flatten", label]];
 
-        // 2. Dense 1 with layer norm.
+        // 2. Dense 1 with layer / rms norm.
         smolgenWeights = [self addFullyConnectedLayerWithParent:smolgenWeights
                                                  outputChannels:smolgen->dense1_b.size()
                                                         weights:&smolgen->dense1_w[0]
@@ -801,15 +813,25 @@ static const NSInteger kMinSubBatchSize = 20;
                                                      activation:smolgenActivation
                                                           label:[NSString stringWithFormat:@"%@/smolgen/dense_1", label]];
 
-        smolgenWeights = [self addLayerNormalizationWithParent:smolgenWeights
-                                         scaledSecondaryTensor:nil
-                                                        gammas:&smolgen->ln1_gammas[0]
-                                                         betas:&smolgen->ln1_betas[0]
-                                                         alpha:0.0
-                                                       epsilon:1e-3
-                                                         label:[NSString stringWithFormat:@"%@/smolgen/ln1", label]];
+        if (smolgen->ln1_gammas.size() > 0 && smolgen->ln1_betas.size() > 0) {
+            smolgenWeights = [self addLayerNormalizationWithParent:smolgenWeights
+                                             scaledSecondaryTensor:nil
+                                                            gammas:&smolgen->ln1_gammas[0]
+                                                             betas:&smolgen->ln1_betas[0]
+                                                             alpha:0.0
+                                                           epsilon:1e-3
+                                                             label:[NSString stringWithFormat:@"%@/smolgen/ln1", label]];
+        }
+        else if (smolgen->ln1_gammas.size() > 0) {
+            smolgenWeights = [self addRmsNormalizationWithParent:smolgenWeights
+                                           scaledSecondaryTensor:nil
+                                                          gammas:&smolgen->ln1_gammas[0]
+                                                           alpha:0.0
+                                                         epsilon:1e-5
+                                                           label:[NSString stringWithFormat:@"%@/smolgen/rmsn1", label]];
+        }
 
-        // 3. Dense 2 with layer norm.
+        // 3. Dense 2 with layer / rms norm.
         smolgenWeights = [self addFullyConnectedLayerWithParent:smolgenWeights
                                                  outputChannels:smolgen->dense2_b.size()
                                                         weights:&smolgen->dense2_w[0]
@@ -817,13 +839,23 @@ static const NSInteger kMinSubBatchSize = 20;
                                                      activation:smolgenActivation
                                                           label:[NSString stringWithFormat:@"%@/smolgen/dense_2", label]];
 
-        smolgenWeights = [self addLayerNormalizationWithParent:smolgenWeights
-                                         scaledSecondaryTensor:nil
-                                                        gammas:&smolgen->ln2_gammas[0]
-                                                         betas:&smolgen->ln2_betas[0]
-                                                         alpha:0.0
-                                                       epsilon:1e-3
-                                                         label:[NSString stringWithFormat:@"%@/smolgen/ln2", label]];
+        if (smolgen->ln2_gammas.size() > 0 && smolgen->ln2_betas.size() > 0) {
+            smolgenWeights = [self addLayerNormalizationWithParent:smolgenWeights
+                                             scaledSecondaryTensor:nil
+                                                            gammas:&smolgen->ln2_gammas[0]
+                                                             betas:&smolgen->ln2_betas[0]
+                                                             alpha:0.0
+                                                           epsilon:1e-3
+                                                             label:[NSString stringWithFormat:@"%@/smolgen/ln2", label]];
+        }
+        else if (smolgen->ln2_gammas.size() > 0) {
+            smolgenWeights = [self addRmsNormalizationWithParent:smolgenWeights
+                                           scaledSecondaryTensor:nil
+                                                          gammas:&smolgen->ln2_gammas[0]
+                                                           alpha:0.0
+                                                         epsilon:1e-5
+                                                           label:[NSString stringWithFormat:@"%@/smolgen/rmsn2", label]];
+        }
 
         smolgenWeights = [self reshapeTensor:smolgenWeights
                                    withShape:@[@(-1), @(heads), @(smolgen->dense2_b.size() / heads)]
@@ -1238,7 +1270,6 @@ static const NSInteger kMinSubBatchSize = 20;
                                        ffnActivation:attentionBody ? ffnActivation : @"selu"
                                                alpha:1.0
                                              epsilon:1e-6
-                                            normtype:@"layernorm"
                                                label:[NSString stringWithFormat:@"%@/encoder_%zu", label, i]];
         }
 

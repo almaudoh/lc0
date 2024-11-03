@@ -115,7 +115,6 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
                                         ffnActivation:(NSString * __nonnull)ffnActivation
                                                 alpha:(float)alpha
                                               epsilon:(float)epsilon
-                                             normtype:(NSString * __nonnull)normtype
                                                 label:(NSString * __nonnull)label;
 
 -(nonnull MPSGraphTensor *) addLayerNormalizationWithParent:(MPSGraphTensor * __nonnull)parent
@@ -130,6 +129,7 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
                                     scaledSecondaryTensor:(MPSGraphTensor * __nullable)secondary
                                                    gammas:(float * __nonnull)gammas
                                                     alpha:(float)alpha
+                                                  epsilon:(float)epsilon
                                                     label:(NSString * __nonnull)label;
 
 -(nonnull MPSGraphTensor *) scaledMHAMatmulWithQueries:(MPSGraphTensor * __nonnull)queries
