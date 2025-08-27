@@ -561,6 +561,7 @@ if get_option('build_backends')
 
     if get_option('cutlass')
       nvcc_cutlass_args = ['-arch=compute_80', '-code=sm_80']
+      nvcc_cutlass_args += ['-isystem third_party']
       files += custom_target('cuda cutlass code',
         input : 'src/neural/cuda/cutlass_kernels.cu',
         output : outputname,
