@@ -550,7 +550,7 @@ if get_option('build_backends')
       endif
     endif
 
-    cuda_arguments += ['-isystem=third_party']
+    cuda_arguments += ['-isystem=@CURRENT_SOURCE_DIR@/third_party']
     foreach x : get_option('cudnn_include')
       cuda_arguments += ['-I', x]
     endforeach
@@ -569,7 +569,7 @@ if get_option('build_backends')
 
     if nvcc_cutlass_args.length() > 0
       files += custom_target('cuda cutlass code',
-        input : 'src/neural/cuda/cutlass_kernels.cu',
+        input : 'src/neural/backends/cuda/cutlass_kernels.cu',
         output : outputname,
         command : [nvcc, nvcc_cutlass_args, cuda_arguments]
       )
