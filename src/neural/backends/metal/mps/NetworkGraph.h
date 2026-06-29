@@ -233,6 +233,8 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
 //                                          executionBackend:(MPSGraphTargetExecutionBackend * __nonnull)backend;
 
 -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                subBatchSize:(NSUInteger)subBatchSize;
+                     splits:(NSUInteger)splits
+               subBatchSize:(NSUInteger)subBatchSize
+          lastSubBatchSize:(NSUInteger)lastSubBatchSize;
 
 @end

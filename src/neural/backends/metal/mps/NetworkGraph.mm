@@ -31,8 +31,6 @@
 #import "neural/tables/policy_map.h"
 #import "NetworkGraph.h"
 
-#define DEBUG 0
-
 static MPSGraphConvolution2DOpDescriptor * __nonnull convolution2DDescriptor = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:1
                                                                                                                                 strideInY:1
                                                                                                                           dilationRateInX:1
@@ -55,7 +53,7 @@ static const NSUInteger kNumPolicyOutputs = 1858;
 static const NSUInteger kMaxInflightBuffers = 2;
 
 // Minimum batch size below which parallel command buffers will not be used.
-static const NSInteger kMinSubBatchSize = 20;
+static const NSInteger kMinSubBatchSize = 1;
 
 @implementation MPSGraphTensor(Lc0Extensions)
 
@@ -92,9 +90,8 @@ static const NSInteger kMinSubBatchSize = 20;
 @property (nonatomic) BOOL isCompiled;
 @property (nonatomic, strong) NSError *compilationError;
 @property (nonatomic, strong) MPSGraphCompilationDescriptor *compilationDescriptor;
-@property (nonatomic) NSTimeInterval compilationTime;
-// @property (nonatomic) NSUInteger totalInferences;
-// @property (nonatomic) NSTimeInterval totalInferenceTime;
+// Whether the compiled executable expects mask as its first input (vs. the value input).
+@property (nonatomic) BOOL executableExpectsMaskFirst;
 @end
 
 @implementation Lc0NetworkGraph
@@ -159,13 +156,11 @@ static const NSInteger kMinSubBatchSize = 20;
     if (@available(macOS 13.0, *)) {
         // Set up compilation completion handler to handle success or failure.
         __weak Lc0NetworkGraph * weakSelf = self;
-        _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * executable, NSError * error) {
+        _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             __strong Lc0NetworkGraph * strongSelf = weakSelf;
             if (error) {
-                if (DEBUG) NSLog(@"Graph compilation failed with error: %@", error.localizedDescription);
                 strongSelf.compilationError = error;
             } else {
-                if (DEBUG) NSLog(@"Graph compilation completed successfully");
                 strongSelf.isCompiled = YES;
             }
         };
@@ -178,17 +173,12 @@ static const NSInteger kMinSubBatchSize = 20;
 -(void) compileGraph
 {
     if (_isCompiled) {
-        if (DEBUG) NSLog(@"Graph already compiled, skipping...");
         return;
     }
 
     if (!_isGraphBuilt || !_inputTensor || !_maskTensor || [_resultTensors count] == 0) {
-        if (DEBUG) NSLog(@"Graph not ready for compilation - missing components");
         return;
     }
-
-    if (DEBUG) NSLog(@"Starting graph compilation...");
-    NSTimeInterval startTime = [NSDate timeIntervalSinceReferenceDate];
 
     // Prepare feeds dictionary with dynamic batch size.
     NSDictionary * feeds = @{
@@ -202,14 +192,16 @@ static const NSInteger kMinSubBatchSize = 20;
                          targetOperations:nil
                     compilationDescriptor:_compilationDescriptor];
 
-    _compilationTime = [NSDate timeIntervalSinceReferenceDate] - startTime;
-
     if (!_executable) {
-        NSLog(@"Graph compilation failed after %.3fs", _compilationTime);
         _isCompiled = NO;
     } else {
-        if (DEBUG) NSLog(@"Graph compilation successful in %.3fs", _compilationTime);
         _isCompiled = YES;
+
+        // NSDictionary enumerates keys in non-deterministic (pointer-hash) order, so the
+        // compiled executable may expect inputs as [mask, input] or [input, mask]. Read
+        // feedTensors to discover the actual ordering and store it for use at inference time.
+        NSArray<MPSGraphTensor *> * feedOrder = _executable.feedTensors;
+        _executableExpectsMaskFirst = ([feedOrder count] >= 2 && feedOrder[0] == _maskTensor);
 
         // Run a warmup inference
         [self performWarmupInference];
@@ -231,8 +223,6 @@ static const NSInteger kMinSubBatchSize = 20;
 
 -(void) performWarmupInference
 {
-    if (DEBUG) NSLog(@"Running warmup inference...");
-
     // Create minimal dummy data for warmup
     const NSUInteger warmupBatchSize = 1;
     const NSUInteger inputChannels = [[_inputTensor.shape objectAtIndex:1] unsignedIntegerValue];
@@ -248,17 +238,11 @@ static const NSInteger kMinSubBatchSize = 20;
         dummyOutputs[i] = (float *)calloc(outputSize, sizeof(float));
     }
 
-    // Run warmup (this will be fast since it's compiled)
-    NSTimeInterval startTime = [NSDate timeIntervalSinceReferenceDate];
     [self runInferenceWithBatchSize:warmupBatchSize
                              inputs:dummyInputs
                               masks:dummyMasks
                             outputs:dummyOutputs];
                 //    executionBackend:nil];
-    NSTimeInterval warmupTime = [NSDate timeIntervalSinceReferenceDate] - startTime;
-
-    if (DEBUG) NSLog(@"Warmup completed in %.3fms", warmupTime * 1000.0);
-
     // Cleanup
     free(dummyInputs);
     free(dummyMasks);
@@ -278,11 +262,17 @@ static const NSInteger kMinSubBatchSize = 20;
 {
     // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
     // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
-    NSUInteger splits = (batchSize + kMinSubBatchSize + 1) / kMinSubBatchSize;
-    if (splits > kMaxInflightBuffers) splits = kMaxInflightBuffers;
+    // Dynamic split calculation based on batch size and hardware capabilities.
+    NSUInteger splits = 1;
+    if (batchSize >= kMinSubBatchSize * 2) {
+        splits = MIN((batchSize + kMinSubBatchSize - 1) / kMinSubBatchSize, kMaxInflightBuffers);
+        // Ensure splits divide evenly for better load balancing.
+        while (splits > 1 && (batchSize % splits) > (splits / 2)) {
+            splits--;
+        }
+    }
     NSUInteger subBatchSize = batchSize / splits;
     NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
-
     // Split batchSize into smaller sub-batches and run using double-buffering.
     // Execute sub-batches with optimized scheduling
     NSMutableArray<MPSCommandBuffer *> * commandBuffers = [NSMutableArray arrayWithCapacity:splits];
@@ -321,7 +311,7 @@ static const NSInteger kMinSubBatchSize = 20;
         }
     }
 
-    [self copyResultsToBuffers:outputBuffers subBatchSize:subBatchSize];
+    [self copyResultsToBuffers:outputBuffers splits:splits subBatchSize:subBatchSize lastSubBatchSize:lastSubBatchSize];
 
     return _resultTensors;
 }
@@ -342,8 +332,7 @@ static const NSInteger kMinSubBatchSize = 20;
     MPSShape * inputShape = @[@(subBatchSize), _inputTensor.shape[1], _inputTensor.shape[2]];
 
     NSData * inputData = [NSData dataWithBytesNoCopy:inputs
-                                            //   length:subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1] * sizeof(float)
-                                              length:subBatchSize * sizeof(float)
+                                              length:subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1] * sizeof(float)
                                         freeWhenDone:NO];
 
     MPSGraphTensorData * inputTensorData = [[MPSGraphTensorData alloc] initWithDevice:_device
@@ -352,8 +341,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                              dataType:_inputTensor.dataType];
 
     NSData * maskData = [NSData dataWithBytesNoCopy:masks
-                                            //  length:subBatchSize * [_maskTensor sizeOfDimensionsFrom:@1] * sizeof(uint64_t)
-                                             length:subBatchSize * sizeof(uint64_t)
+                                             length:subBatchSize * [_maskTensor sizeOfDimensionsFrom:@1] * sizeof(uint64_t)
                                        freeWhenDone:NO];
 
     MPSGraphTensorData * inputMaskData = [[MPSGraphTensorData alloc] initWithDevice:_device
@@ -376,8 +364,12 @@ static const NSInteger kMinSubBatchSize = 20;
         dispatch_semaphore_signal(_doubleBufferingSemaphore);
     };
 
+    NSArray<MPSGraphTensorData *> * inputsArray = _executableExpectsMaskFirst
+        ? @[inputMaskData, inputTensorData]
+        : @[inputTensorData, inputMaskData];
+
     [_executable encodeToCommandBuffer:commandBuffer
-                           inputsArray:@[inputTensorData, inputMaskData]
+                           inputsArray:inputsArray
                           resultsArray:_resultDataDicts[@(subBatch)]
                 executionDescriptor:executionDescriptor];
 
@@ -388,14 +380,20 @@ static const NSInteger kMinSubBatchSize = 20;
 
 
 -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                subBatchSize:(NSUInteger)subBatchSize
+                     splits:(NSUInteger)splits
+               subBatchSize:(NSUInteger)subBatchSize
+          lastSubBatchSize:(NSUInteger)lastSubBatchSize
 {
-    // Copy results for batch back into the output buffers.
+    // Copy results for each sub-batch into the output buffers.
+    // Use per-result-tensor element count (from dim 1 onward) and the actual sub-batch sizes.
     for (NSUInteger rsIdx = 0; rsIdx < [_resultTensors count]; rsIdx++) {
-        NSUInteger outputDataLength = [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1] * subBatchSize;
-        for (NSUInteger subBatch = 0; subBatch < [_resultDataDicts count]; subBatch++) {
-            [[_resultDataDicts[@(subBatch)][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + subBatch * outputDataLength
-                                                                             strideBytes:nil];
+        NSUInteger elementsPerItem = [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1];
+        NSUInteger offset = 0;
+        for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
+            NSUInteger thisBatchSize = (subBatch < splits - 1) ? subBatchSize : lastSubBatchSize;
+            [[_resultDataDicts[@(subBatch)][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
+                                                             strideBytes:nil];
+            offset += thisBatchSize * elementsPerItem;
         }
     }
 }
@@ -412,9 +410,8 @@ static const NSInteger kMinSubBatchSize = 20;
     _targetTensors = [_targetTensors arrayByAddingObjectsFromArray:[_readVariables allValues]];
     _isGraphBuilt = YES;
 
-    if (DEBUG) NSLog(@"Graph built with %lu result tensors", (unsigned long)[results count]);
-
 }
+
 
 #pragma mark - Input/Output Tensor Creation Methods
 
@@ -779,13 +776,19 @@ static const NSInteger kMinSubBatchSize = 20;
 
     parent = [self flatten2DTensor:parent axis:1 name:[NSString stringWithFormat:@"%@/flatten", label]];
 
+    // Transpose to [flat, N] so the gather axis (0) has no outer batch dimension.
+    // Gathering on axis 0 with batchDimensions=0 produces [1858, N]; transpose back to [N, 1858].
+    parent = [self transposeTensor:parent dimension:0 withDimension:1
+                              name:[NSString stringWithFormat:@"%@/transpose_pre", label]];
+
     MPSGraphTensor * policyTensor = [self gatherWithUpdatesTensor:parent
                                                     indicesTensor:indicesTensor
-                                                             axis:1
+                                                             axis:0
                                                   batchDimensions:0
                                                              name:[NSString stringWithFormat:@"%@/gather", label]];
 
-    return policyTensor;
+    return [self transposeTensor:policyTensor dimension:0 withDimension:1
+                            name:[NSString stringWithFormat:@"%@/transpose_post", label]];
 }
 
 -(nonnull MPSGraphTensor *) addEncoderLayerWithParent:(MPSGraphTensor * __nonnull)parent
