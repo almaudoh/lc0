@@ -387,11 +387,17 @@ static const NSInteger kMinSubBatchSize = 20;
                 subBatchSize:(NSUInteger)subBatchSize
            lastSubBatchSize:(NSUInteger)lastSubBatchSize
 {
-    for (NSUInteger rsIdx = 0; rsIdx < [_resultTensors count]; rsIdx++) {
+    NSUInteger expectedResults = [_resultTensors count];
+    for (NSUInteger rsIdx = 0; rsIdx < expectedResults; rsIdx++) {
         NSUInteger elementsPerItem = [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1];
         NSUInteger offset = 0;
         for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
             NSUInteger thisBatchSize = (subBatch < splits - 1) ? subBatchSize : lastSubBatchSize;
+            if ([resultStore[subBatch] count] < expectedResults) {
+                [NSException raise:@"MetalInferenceError"
+                            format:@"Sub-batch %lu produced no results (GPU error during inference).",
+                                   (unsigned long)subBatch];
+            }
             [[resultStore[subBatch][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
                                                      strideBytes:nil];
             offset += thisBatchSize * elementsPerItem;
