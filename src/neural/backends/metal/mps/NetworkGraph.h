@@ -69,8 +69,6 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     BOOL _isGraphBuilt;
     BOOL _isCompiled;
     NSError * _compilationError;
-//    NSUInteger _totalInferences;
-//    NSUInteger _totalInferenceTime;
 }
 
 +(Lc0NetworkGraph * _Nonnull) getGraphAt:(NSNumber * _Nonnull)index;
@@ -224,13 +222,11 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
                                                           inputs:(float * __nonnull)inputs
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers;
-//                                                executionBackend:(MPSGraphTargetExecutionBackend * __nonnull)backend;
 
 -(nonnull MPSCommandBuffer *) runCommandSubBatchWithInputs:(float * __nonnull)inputs
                                                      masks:(uint64_t * __nonnull)masks
                                                   subBatch:(NSUInteger)subBatch
                                               subBatchSize:(NSUInteger)subBatchSize;
-//                                          executionBackend:(MPSGraphTargetExecutionBackend * __nonnull)backend;
 
 -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
                      splits:(NSUInteger)splits

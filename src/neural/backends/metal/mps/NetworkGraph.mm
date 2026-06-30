@@ -147,8 +147,6 @@ static const NSInteger kMinSubBatchSize = 1;
     _isGraphBuilt = NO;
     _isCompiled = NO;
     _compilationError = nil;
-    // _totalInferences = 0;
-    // _totalInferenceTime = 0.0;
 
     // Setup compilation descriptor with optimizations
     _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
@@ -242,7 +240,7 @@ static const NSInteger kMinSubBatchSize = 1;
                              inputs:dummyInputs
                               masks:dummyMasks
                             outputs:dummyOutputs];
-                //    executionBackend:nil];
+
     // Cleanup
     free(dummyInputs);
     free(dummyMasks);
@@ -258,7 +256,6 @@ static const NSInteger kMinSubBatchSize = 1;
                                                           inputs:(float * __nonnull)inputs
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
-                                                // executionBackend:(MPSGraphTargetExecutionBackend * __nonnull)backend
 {
     // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
     // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
@@ -283,7 +280,6 @@ static const NSInteger kMinSubBatchSize = 1;
                                                                         masks:masks + subBatch * inputDataLength
                                                                      subBatch:subBatch
                                                                  subBatchSize:subBatchSize];
-                                                            // executionBackend:backend];
         if (commandBuffer) {
             [commandBuffers addObject:commandBuffer];
         }
@@ -296,7 +292,6 @@ static const NSInteger kMinSubBatchSize = 1;
                                                                         masks:masks + lastSubBatch * inputDataLength
                                                                      subBatch:lastSubBatch
                                                                  subBatchSize:lastSubBatchSize];
-                                                            // executionBackend:backend];
     if (lastCommandBuffer) {
         [commandBuffers addObject:lastCommandBuffer];
     }
@@ -320,7 +315,6 @@ static const NSInteger kMinSubBatchSize = 1;
                                                      masks:(uint64_t * __nonnull)masks
                                                   subBatch:(NSUInteger)subBatch
                                               subBatchSize:(NSUInteger)subBatchSize
-                                        //   executionBackend:(MPSGraphTargetExecutionBackend * __nonnull)backend
 {
     // Double buffering semaphore to correctly double buffer iterations.
     dispatch_semaphore_wait(_doubleBufferingSemaphore, DISPATCH_TIME_FOREVER);
@@ -351,7 +345,6 @@ static const NSInteger kMinSubBatchSize = 1;
 
     // Create execution descriptor with block to update results for each iteration.
     MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
-    // executionDescriptor.targetExecutionBackend = backend;
 
     executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
         if (error) {
