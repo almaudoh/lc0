@@ -200,18 +200,6 @@ static const NSInteger kMinSubBatchSize = 20;
     }
 }
 
--(void) compileGraphAsync:(void (^)(BOOL success, NSError *error))completion
-{
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        [self compileGraph];
-
-        if (completion) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completion(self.isCompiled, self.compilationError);
-            });
-        }
-    });
-}
 
 -(void) performWarmupInference
 {
