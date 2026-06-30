@@ -150,12 +150,10 @@ static const NSInteger kMinSubBatchSize = 20;
     _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
     _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
     if (@available(macOS 13.0, *)) {
-        // Set up compilation completion handler to handle success or failure.
         __weak Lc0NetworkGraph * weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             __strong Lc0NetworkGraph * strongSelf = weakSelf;
             strongSelf.compilationError = error;
-            strongSelf.isCompiled = (error == nil);
         };
     }
     return self;
@@ -165,7 +163,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
 -(void) compileGraph
 {
-    if (_isCompiled) {
+    if (_executable) {
         return;
     }
 
@@ -173,28 +171,24 @@ static const NSInteger kMinSubBatchSize = 20;
         return;
     }
 
-    // Prepare feeds dictionary with dynamic batch size.
-    NSDictionary * feeds = @{
-        _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
-        _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
-    };
-
     if (@available(macOS 13.0, *)) {
+        // Prepare feeds dictionary with dynamic batch size.
+        NSDictionary * feeds = @{
+            _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
+            _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
+        };
+
         _executable = [self compileWithDevice:_device
                                         feeds:feeds
                                 targetTensors:_targetTensors
                              targetOperations:nil
                         compilationDescriptor:_compilationDescriptor];
-    } else {
-        return;
     }
 
-    if (!_executable) {
-        _isCompiled = NO;
-    } else {
-        _isCompiled = YES;
+    // Sync _isCompiled with _executable so external callers see consistent state.
+    _isCompiled = (_executable != nil);
 
-        // Run a warmup inference
+    if (_executable) {
         [self performWarmupInference];
     }
 }
@@ -250,7 +244,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
-    // Clear stale result buffers so MPS allocates fresh ones with the correct batch-sized shape.
+    // Clear stale results so GPU errors from a prior call don't leak through as valid data.
     [_resultDataDicts removeAllObjects];
 
     // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
@@ -270,36 +264,23 @@ static const NSInteger kMinSubBatchSize = 20;
     // Execute sub-batches with optimized scheduling
     NSMutableArray<MPSCommandBuffer *> * commandBuffers = [NSMutableArray arrayWithCapacity:splits];
 
-    // Process all sub-batches except the last one
     for (NSUInteger subBatch = 0; subBatch < splits - 1; subBatch++) {
-        MPSCommandBuffer * commandBuffer = [self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                                        masks:masks + subBatch * inputDataLength
-                                                                     subBatch:subBatch
-                                                                 subBatchSize:subBatchSize];
-        if (commandBuffer) {
-            [commandBuffers addObject:commandBuffer];
-        }
+        [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
+                                                               masks:masks + subBatch * inputDataLength
+                                                            subBatch:subBatch
+                                                        subBatchSize:subBatchSize]];
     }
 
-    // Handle last sub-batch (may have different size)
+    // Last sub-batch may have a different size if batchSize is not evenly divisible.
     NSUInteger lastSubBatch = splits - 1;
     NSUInteger lastSubBatchSize = batchSize - lastSubBatch * subBatchSize;
-    MPSCommandBuffer * lastCommandBuffer = [self runCommandSubBatchWithInputs:inputs + lastSubBatch * inputDataLength
-                                                                        masks:masks + lastSubBatch * inputDataLength
-                                                                     subBatch:lastSubBatch
-                                                                 subBatchSize:lastSubBatchSize];
-    if (lastCommandBuffer) {
-        [commandBuffers addObject:lastCommandBuffer];
-    }
+    [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + lastSubBatch * inputDataLength
+                                                           masks:masks + lastSubBatch * inputDataLength
+                                                        subBatch:lastSubBatch
+                                                    subBatchSize:lastSubBatchSize]];
 
-    // Wait for all command buffers to complete
     for (MPSCommandBuffer * commandBuffer in commandBuffers) {
         [commandBuffer waitUntilCompleted];
-
-        // Check for execution errors
-        if (commandBuffer.commandBuffer.status == MTLCommandBufferStatusError) {
-            NSLog(@"Command buffer execution error: %@", commandBuffer.commandBuffer.error.localizedDescription);
-        }
     }
 
     [self copyResultsToBuffers:outputBuffers splits:splits subBatchSize:subBatchSize lastSubBatchSize:lastSubBatchSize];
