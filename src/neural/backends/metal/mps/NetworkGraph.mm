@@ -250,12 +250,12 @@ static const NSInteger kMinSubBatchSize = 20;
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
-    // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
-    // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
-    // Dynamic split calculation based on batch size and hardware capabilities.
     // Clear stale result buffers so MPS allocates fresh ones with the correct batch-sized shape.
     [_resultDataDicts removeAllObjects];
 
+    // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
+    // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
+    // Dynamic split calculation based on batch size and hardware capabilities.
     NSUInteger splits = 1;
     if (batchSize >= kMinSubBatchSize * 2) {
         splits = MIN((batchSize + kMinSubBatchSize - 1) / kMinSubBatchSize, kMaxInflightBuffers);
@@ -363,7 +363,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     [_executable encodeToCommandBuffer:commandBuffer
                            inputsArray:inputsArray
-                          resultsArray:nil
+                          resultsArray:_resultDataDicts[@(subBatch)]
                     executionDescriptor:executionDescriptor];
 
     // Commit the command buffer
