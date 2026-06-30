@@ -316,5 +316,11 @@ void MetalNetworkBuilder::forwardEval(float * inputs, uint64_t * masks, int batc
     }
 }
 
+bool MetalNetworkBuilder::isCompiled() const
+{
+    Lc0NetworkGraph * graph = [Lc0NetworkGraph getGraphAt:[NSNumber numberWithInt:this->gpu_id]];
+    return graph->_isCompiled == YES;
+}
+
 }  // namespace metal_backend
 }  // namespace lczero

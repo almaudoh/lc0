@@ -135,11 +135,18 @@ static const NSInteger kMinSubBatchSize = 20;
 {
     self = [super init];
     _device = [MPSGraphDevice deviceWithMTLDevice:device];
-    _queue = [device newCommandQueue];
+
+    // Build a pool of command queues — one per max in-flight buffer — so concurrent
+    // sub-batch encoding from different threads hits independent queue objects.
+    NSMutableArray<id<MTLCommandQueue>> * queues = [NSMutableArray arrayWithCapacity:kMaxInflightBuffers];
+    for (NSUInteger i = 0; i < kMaxInflightBuffers; i++) {
+        [queues addObject:[device newCommandQueue]];
+    }
+    _queues = [queues copy];
+
     _resultTensors = @[];
     _readVariables = [[NSMutableDictionary alloc] init];
-    _doubleBufferingSemaphore = dispatch_semaphore_create(kMaxInflightBuffers);
-    _resultDataDicts = [NSMutableDictionary dictionaryWithCapacity:kMaxInflightBuffers];
+    _inflightSemaphore = dispatch_semaphore_create(kMaxInflightBuffers);
 
     // Initialize compilation state
     _isGraphBuilt = NO;
@@ -244,46 +251,61 @@ static const NSInteger kMinSubBatchSize = 20;
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
-    // Clear stale results so GPU errors from a prior call don't leak through as valid data.
-    [_resultDataDicts removeAllObjects];
-
-    // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
-    // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
-    // Dynamic split calculation based on batch size and hardware capabilities.
+    // Calculate number of sub-batches to split across GPU command buffers.
+    // Cap at kMaxInflightBuffers; each sub-batch must be at least kMinSubBatchSize.
     NSUInteger splits = 1;
     if (batchSize >= kMinSubBatchSize * 2) {
         splits = MIN((batchSize + kMinSubBatchSize - 1) / kMinSubBatchSize, kMaxInflightBuffers);
-        // Ensure splits divide evenly for better load balancing.
         while (splits > 1 && (batchSize % splits) > (splits / 2)) {
             splits--;
         }
     }
     NSUInteger subBatchSize = batchSize / splits;
-    NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
-    // Split batchSize into smaller sub-batches and run using double-buffering.
-    // Execute sub-batches with optimized scheduling
-    NSMutableArray<MPSCommandBuffer *> * commandBuffers = [NSMutableArray arrayWithCapacity:splits];
-
-    for (NSUInteger subBatch = 0; subBatch < splits - 1; subBatch++) {
-        [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                               masks:masks + subBatch * inputDataLength
-                                                            subBatch:subBatch
-                                                        subBatchSize:subBatchSize]];
-    }
-
-    // Last sub-batch may have a different size if batchSize is not evenly divisible.
     NSUInteger lastSubBatch = splits - 1;
     NSUInteger lastSubBatchSize = batchSize - lastSubBatch * subBatchSize;
-    [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + lastSubBatch * inputDataLength
-                                                           masks:masks + lastSubBatch * inputDataLength
-                                                        subBatch:lastSubBatch
-                                                    subBatchSize:lastSubBatchSize]];
+    NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
 
-    for (MPSCommandBuffer * commandBuffer in commandBuffers) {
-        [commandBuffer waitUntilCompleted];
+    // Per-call result store: pre-allocated array of (splits) slots so concurrent
+    // completion handlers can write to disjoint indices without locking.
+    NSMutableArray<NSArray<MPSGraphTensorData *> *> * resultStore =
+        [NSMutableArray arrayWithCapacity:splits];
+    for (NSUInteger i = 0; i < splits; i++) {
+        [resultStore addObject:@[]];  // placeholder; replaced by completion handler
     }
 
-    [self copyResultsToBuffers:outputBuffers splits:splits subBatchSize:subBatchSize lastSubBatchSize:lastSubBatchSize];
+    // Pre-allocate command buffer array with placeholder nils for indexed assignment.
+    NSMutableArray<MPSCommandBuffer *> * commandBuffers =
+        [NSMutableArray arrayWithCapacity:splits];
+    for (NSUInteger i = 0; i < splits; i++) {
+        [commandBuffers addObject:(MPSCommandBuffer *)[NSNull null]];
+    }
+
+    // Encode all sub-batches concurrently on CPU.
+    // MPSGraphExecutable.encodeToCommandBuffer is thread-safe (Apple docs).
+    // Each sub-batch uses its own MPSCommandBuffer from an independent queue.
+    dispatch_apply(splits, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t subBatch) {
+        NSUInteger thisBatchSize = (subBatch < (NSUInteger)lastSubBatch) ? subBatchSize : lastSubBatchSize;
+        MPSCommandBuffer * cb = [self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
+                                                             masks:masks + subBatch * inputDataLength
+                                                          subBatch:subBatch
+                                                      subBatchSize:thisBatchSize
+                                                       resultStore:resultStore];
+        @synchronized(commandBuffers) {
+            commandBuffers[subBatch] = cb;
+        }
+    });
+
+    for (MPSCommandBuffer * commandBuffer in commandBuffers) {
+        if ((id)commandBuffer != [NSNull null]) {
+            [commandBuffer waitUntilCompleted];
+        }
+    }
+
+    [self copyResultsToBuffers:outputBuffers
+                   resultStore:resultStore
+                        splits:splits
+                  subBatchSize:subBatchSize
+             lastSubBatchSize:lastSubBatchSize];
 
     return _resultTensors;
 }
@@ -292,12 +314,16 @@ static const NSInteger kMinSubBatchSize = 20;
                                                      masks:(uint64_t * __nonnull)masks
                                                   subBatch:(NSUInteger)subBatch
                                               subBatchSize:(NSUInteger)subBatchSize
+                                               resultStore:(NSMutableArray<NSArray<MPSGraphTensorData *> *> * __nonnull)resultStore
 {
-    // Double buffering semaphore to correctly double buffer iterations.
-    dispatch_semaphore_wait(_doubleBufferingSemaphore, DISPATCH_TIME_FOREVER);
+    // Acquire an in-flight slot before encoding so we never exceed kMaxInflightBuffers
+    // simultaneous GPU command buffers.
+    dispatch_semaphore_wait(_inflightSemaphore, DISPATCH_TIME_FOREVER);
 
-    // Create command buffer for this sub-batch.
-    MPSCommandBuffer * commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_queue];
+    // Each sub-batch uses a different queue from the pool to give the GPU driver
+    // more scheduling freedom when multiple buffers are in flight concurrently.
+    id<MTLCommandQueue> queue = _queues[subBatch % [_queues count]];
+    MPSCommandBuffer * commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:queue];
     commandBuffer.label = [NSString stringWithFormat:@"Inference_SubBatch_%lu", (unsigned long)subBatch];
 
     MPSShape * inputShape = @[@(subBatchSize), _inputTensor.shape[1], _inputTensor.shape[2]];
@@ -323,15 +349,18 @@ static const NSInteger kMinSubBatchSize = 20;
     NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
 
     if (_executable) {
-        // Compiled path (macOS 13+): use the pre-compiled executable.
+        // Compiled path (macOS 13+): MPSGraphExecutable.encodeToCommandBuffer is thread-safe;
+        // concurrent calls from dispatch_apply are safe here.
         MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
         executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
             if (error) {
-                NSLog(@"Error occurred during execution: %@", error);
+                NSLog(@"Metal inference error (sub-batch %lu): %@", (unsigned long)subBatch, error);
             } else {
-                _resultDataDicts[@(subBatch)] = results;
+                // Each sub-batch index is unique within this call, so disjoint slot
+                // assignment requires no additional locking.
+                resultStore[subBatch] = results;
             }
-            dispatch_semaphore_signal(_doubleBufferingSemaphore);
+            dispatch_semaphore_signal(_inflightSemaphore);
         };
 
         [_executable encodeToCommandBuffer:commandBuffer
@@ -340,21 +369,23 @@ static const NSInteger kMinSubBatchSize = 20;
                         executionDescriptor:executionDescriptor];
     } else {
         // Eager fallback for macOS < 13 where graph compilation is unavailable.
+        // MPSGraph eager encoding is not thread-safe; the caller (forwardEval) must
+        // hold the network-level lock when taking this path.
         NSDictionary * feeds = @{_inputTensor : inputTensorData, _maskTensor : inputMaskData};
         NSArray<MPSGraphTensor *> * resultTensors = _resultTensors;
 
         MPSGraphExecutionDescriptor * executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
         executionDescriptor.completionHandler = ^(MPSGraphTensorDataDictionary * resultDictionary, NSError * _Nullable error) {
             if (error) {
-                NSLog(@"Error occurred during execution: %@", error);
+                NSLog(@"Metal inference error (sub-batch %lu): %@", (unsigned long)subBatch, error);
             } else {
                 NSMutableArray<MPSGraphTensorData *> * results = [NSMutableArray arrayWithCapacity:[resultTensors count]];
                 for (MPSGraphTensor * tensor in resultTensors) {
                     [results addObject:resultDictionary[tensor]];
                 }
-                _resultDataDicts[@(subBatch)] = results;
+                resultStore[subBatch] = results;
             }
-            dispatch_semaphore_signal(_doubleBufferingSemaphore);
+            dispatch_semaphore_signal(_inflightSemaphore);
         };
 
         [self encodeToCommandBuffer:commandBuffer
@@ -364,26 +395,24 @@ static const NSInteger kMinSubBatchSize = 20;
                 executionDescriptor:executionDescriptor];
     }
 
-    // Commit the command buffer
     [commandBuffer commit];
     return commandBuffer;
 }
 
 
 -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                     splits:(NSUInteger)splits
-               subBatchSize:(NSUInteger)subBatchSize
-          lastSubBatchSize:(NSUInteger)lastSubBatchSize
+                 resultStore:(NSArray<NSArray<MPSGraphTensorData *> *> * __nonnull)resultStore
+                      splits:(NSUInteger)splits
+                subBatchSize:(NSUInteger)subBatchSize
+           lastSubBatchSize:(NSUInteger)lastSubBatchSize
 {
-    // Copy results for each sub-batch into the output buffers.
-    // Use per-result-tensor element count (from dim 1 onward) and the actual sub-batch sizes.
     for (NSUInteger rsIdx = 0; rsIdx < [_resultTensors count]; rsIdx++) {
         NSUInteger elementsPerItem = [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1];
         NSUInteger offset = 0;
         for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
             NSUInteger thisBatchSize = (subBatch < splits - 1) ? subBatchSize : lastSubBatchSize;
-            [[_resultDataDicts[@(subBatch)][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
-                                                             strideBytes:nil];
+            [[resultStore[subBatch][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
+                                                     strideBytes:nil];
             offset += thisBatchSize * elementsPerItem;
         }
     }

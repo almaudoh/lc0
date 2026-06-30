@@ -46,7 +46,9 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
 @public
     // Keep the device and command queue objects around for ease of use.
     MPSGraphDevice * _device;
-    id<MTLCommandQueue> _queue;
+
+    // Pool of command queues for concurrent sub-batch submission.
+    NSArray<id<MTLCommandQueue>> * _queues;
 
     // Input tensor and tensor data placeholders.
     MPSGraphTensor * _inputTensor;
@@ -55,11 +57,10 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     // Variables to track results of graph inference.
     NSArray<MPSGraphTensor *> * _resultTensors;
     NSArray<MPSGraphTensor *> * _targetTensors;
-    NSMutableDictionary<NSNumber *, NSArray<MPSGraphTensorData *> *> * _resultDataDicts;
     NSMutableDictionary<NSString *, MPSGraphTensor *> * _readVariables;
 
-    // Variables for triple buffering
-    dispatch_semaphore_t _doubleBufferingSemaphore;
+    // Semaphore limiting GPU in-flight command buffers.
+    dispatch_semaphore_t _inflightSemaphore;
 
     // Global smolgen weights.
     float * __nullable _globalSmolgenWeights;
@@ -226,11 +227,13 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
 -(nonnull MPSCommandBuffer *) runCommandSubBatchWithInputs:(float * __nonnull)inputs
                                                      masks:(uint64_t * __nonnull)masks
                                                   subBatch:(NSUInteger)subBatch
-                                              subBatchSize:(NSUInteger)subBatchSize;
+                                              subBatchSize:(NSUInteger)subBatchSize
+                                               resultStore:(NSMutableArray<NSArray<MPSGraphTensorData *> *> * __nonnull)resultStore;
 
 -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                     splits:(NSUInteger)splits
-               subBatchSize:(NSUInteger)subBatchSize
-          lastSubBatchSize:(NSUInteger)lastSubBatchSize;
+                 resultStore:(NSArray<NSArray<MPSGraphTensorData *> *> * __nonnull)resultStore
+                      splits:(NSUInteger)splits
+                subBatchSize:(NSUInteger)subBatchSize
+           lastSubBatchSize:(NSUInteger)lastSubBatchSize;
 
 @end
