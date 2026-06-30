@@ -90,8 +90,6 @@ static const NSInteger kMinSubBatchSize = 20;
 @property (nonatomic) BOOL isCompiled;
 @property (nonatomic, strong) NSError *compilationError;
 @property (nonatomic, strong) MPSGraphCompilationDescriptor *compilationDescriptor;
-// Whether the compiled executable expects mask as its first input (vs. the value input).
-@property (nonatomic) BOOL executableExpectsMaskFirst;
 @end
 
 @implementation Lc0NetworkGraph
@@ -196,12 +194,6 @@ static const NSInteger kMinSubBatchSize = 20;
     } else {
         _isCompiled = YES;
 
-        // NSDictionary enumerates keys in non-deterministic (pointer-hash) order, so the
-        // compiled executable may expect inputs as [mask, input] or [input, mask]. Read
-        // feedTensors to discover the actual ordering and store it for use at inference time.
-        NSArray<MPSGraphTensor *> * feedOrder = _executable.feedTensors;
-        _executableExpectsMaskFirst = ([feedOrder count] >= 2 && feedOrder[0] == _maskTensor);
-
         // Run a warmup inference
         [self performWarmupInference];
     }
@@ -261,6 +253,9 @@ static const NSInteger kMinSubBatchSize = 20;
     // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
     // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
     // Dynamic split calculation based on batch size and hardware capabilities.
+    // Clear stale result buffers so MPS allocates fresh ones with the correct batch-sized shape.
+    [_resultDataDicts removeAllObjects];
+
     NSUInteger splits = 1;
     if (batchSize >= kMinSubBatchSize * 2) {
         splits = MIN((batchSize + kMinSubBatchSize - 1) / kMinSubBatchSize, kMaxInflightBuffers);
@@ -358,9 +353,7 @@ static const NSInteger kMinSubBatchSize = 20;
         dispatch_semaphore_signal(_doubleBufferingSemaphore);
     };
 
-    NSArray<MPSGraphTensorData *> * inputsArray = _executableExpectsMaskFirst
-        ? @[inputMaskData, inputTensorData]
-        : @[inputTensorData, inputMaskData];
+    NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
 
     if (!_executable) {
         dispatch_semaphore_signal(_doubleBufferingSemaphore);
