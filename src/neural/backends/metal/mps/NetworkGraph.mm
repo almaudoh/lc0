@@ -53,7 +53,7 @@ static const NSUInteger kNumPolicyOutputs = 1858;
 static const NSUInteger kMaxInflightBuffers = 2;
 
 // Minimum batch size below which parallel command buffers will not be used.
-static const NSInteger kMinSubBatchSize = 1;
+static const NSInteger kMinSubBatchSize = 20;
 
 @implementation MPSGraphTensor(Lc0Extensions)
 
