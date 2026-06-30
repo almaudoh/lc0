@@ -339,32 +339,49 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                               shape:inputShape
                                                                            dataType:MPSDataTypeUInt64];
 
-    // Create execution descriptor with block to update results for each iteration.
-    MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
-
-    executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
-        if (error) {
-            NSLog(@"Error occurred during execution: %@", error);
-        } else {
-            _resultDataDicts[@(subBatch)] = results;
-        }
-
-        // Release double buffering semaphore for the next training iteration to be encoded.
-        dispatch_semaphore_signal(_doubleBufferingSemaphore);
-    };
-
     NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
 
-    if (!_executable) {
-        dispatch_semaphore_signal(_doubleBufferingSemaphore);
-        [NSException raise:@"MPSGraph executable missing"
-                    format:@"compileGraph must succeed before runInferenceWithBatchSize:"];
-    }
+    if (_executable) {
+        // Compiled path (macOS 13+): use the pre-compiled executable.
+        MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
+            if (error) {
+                NSLog(@"Error occurred during execution: %@", error);
+            } else {
+                _resultDataDicts[@(subBatch)] = results;
+            }
+            dispatch_semaphore_signal(_doubleBufferingSemaphore);
+        };
 
-    [_executable encodeToCommandBuffer:commandBuffer
-                           inputsArray:inputsArray
-                          resultsArray:_resultDataDicts[@(subBatch)]
-                    executionDescriptor:executionDescriptor];
+        [_executable encodeToCommandBuffer:commandBuffer
+                               inputsArray:inputsArray
+                              resultsArray:nil
+                        executionDescriptor:executionDescriptor];
+    } else {
+        // Eager fallback for macOS < 13 where graph compilation is unavailable.
+        NSDictionary * feeds = @{_inputTensor : inputTensorData, _maskTensor : inputMaskData};
+        NSArray<MPSGraphTensor *> * resultTensors = _resultTensors;
+
+        MPSGraphExecutionDescriptor * executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+        executionDescriptor.completionHandler = ^(MPSGraphTensorDataDictionary * resultDictionary, NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"Error occurred during execution: %@", error);
+            } else {
+                NSMutableArray<MPSGraphTensorData *> * results = [NSMutableArray arrayWithCapacity:[resultTensors count]];
+                for (MPSGraphTensor * tensor in resultTensors) {
+                    [results addObject:resultDictionary[tensor]];
+                }
+                _resultDataDicts[@(subBatch)] = results;
+            }
+            dispatch_semaphore_signal(_doubleBufferingSemaphore);
+        };
+
+        [self encodeToCommandBuffer:commandBuffer
+                              feeds:feeds
+                      targetTensors:_targetTensors
+                   targetOperations:nil
+                executionDescriptor:executionDescriptor];
+    }
 
     // Commit the command buffer
     [commandBuffer commit];
