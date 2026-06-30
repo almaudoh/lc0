@@ -156,11 +156,8 @@ static const NSInteger kMinSubBatchSize = 20;
         __weak Lc0NetworkGraph * weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             __strong Lc0NetworkGraph * strongSelf = weakSelf;
-            if (error) {
-                strongSelf.compilationError = error;
-            } else {
-                strongSelf.isCompiled = YES;
-            }
+            strongSelf.compilationError = error;
+            strongSelf.isCompiled = (error == nil);
         };
     }
     return self;
@@ -184,11 +181,15 @@ static const NSInteger kMinSubBatchSize = 20;
         _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
     };
 
-    _executable = [self compileWithDevice:_device
-                                    feeds:feeds
-                            targetTensors:_targetTensors
-                         targetOperations:nil
-                    compilationDescriptor:_compilationDescriptor];
+    if (@available(macOS 13.0, *)) {
+        _executable = [self compileWithDevice:_device
+                                        feeds:feeds
+                                targetTensors:_targetTensors
+                             targetOperations:nil
+                        compilationDescriptor:_compilationDescriptor];
+    } else {
+        return;
+    }
 
     if (!_executable) {
         _isCompiled = NO;
@@ -361,10 +362,16 @@ static const NSInteger kMinSubBatchSize = 20;
         ? @[inputMaskData, inputTensorData]
         : @[inputTensorData, inputMaskData];
 
+    if (!_executable) {
+        dispatch_semaphore_signal(_doubleBufferingSemaphore);
+        [NSException raise:@"MPSGraph executable missing"
+                    format:@"compileGraph must succeed before runInferenceWithBatchSize:"];
+    }
+
     [_executable encodeToCommandBuffer:commandBuffer
                            inputsArray:inputsArray
-                          resultsArray:_resultDataDicts[@(subBatch)]
-                executionDescriptor:executionDescriptor];
+                          resultsArray:nil
+                    executionDescriptor:executionDescriptor];
 
     // Commit the command buffer
     [commandBuffer commit];

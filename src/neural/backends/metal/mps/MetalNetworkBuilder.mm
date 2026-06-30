@@ -305,7 +305,9 @@ void MetalNetworkBuilder::build(int kInputPlanes, MultiHeadWeights& weights, Inp
     }
 
     // Compile the graph.
-    [graph compileGraph];
+    if (@available(macOS 13.0, *)) {
+        [graph compileGraph];
+    }
 }
 
 void MetalNetworkBuilder::forwardEval(float * inputs, uint64_t * masks, int batchSize, std::vector<float *> output_mems)

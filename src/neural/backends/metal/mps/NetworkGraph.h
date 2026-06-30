@@ -78,10 +78,7 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
 
 -(nonnull instancetype) initWithDevice:(id<MTLDevice> __nonnull)device;
 
--(void) compileGraph;
-
--(void) compileGraphAsync:(void (^ __nonnull)(BOOL success, NSError * __nonnull error))completion;
-
+-(void) compileGraphAsync:(void (^ __nonnull)(BOOL success, NSError * _Nullable error))completion;
 -(nonnull MPSGraphTensor *) inputPlaceholderWithInputChannels:(NSUInteger)channels
                                                         label:(NSString * __nullable)label;
 
