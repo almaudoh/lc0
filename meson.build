@@ -16,7 +16,9 @@
 
 project('lc0', 'cpp',
         default_options : ['cpp_std=c++20', 'b_ndebug=if-release', 'warning_level=3', 'b_lto=true', 'b_vscrt=mt'],
-        meson_version: '>=0.55')
+        meson_version: '>=0.60')
+
+fs = import('fs')
 
 cc = meson.get_compiler('cpp')
 
@@ -60,37 +62,19 @@ includes += include_directories('third_party', is_system: true)
 compile_proto = find_program('scripts/compile_proto.py')
 gen = generator(compile_proto, output: ['@BASENAME@.pb.h'],
   arguments : [
-    '--proto_path=@CURRENT_SOURCE_DIR@/libs/lczero-common',
+    '--proto_path=@CURRENT_SOURCE_DIR@',
     '--cpp_out=@BUILD_DIR@',
     '@INPUT@'])
 
-# Handle submodules.
-git = find_program('git', required: false)
-if run_command('scripts/checkdir.py', 'libs/lczero-common/proto', check : false).returncode() != 0
-  if git.found()
-    if run_command(git, 'status', check : false).returncode() == 0
-      message('updating git submodule libs/lczero-common')
-      run_command(git, 'submodule', 'update', '--init', '--recursive', check : false)
-    else
-      message('cloning lczero-common.git into libs/lczero-common')
-      run_command(git, 'clone', '--depth=1',
-                  'https://github.com/LeelaChessZero/lczero-common.git',
-                  'libs/lczero-common/', check : false)
-    endif
-  else
-    error('Please install git to automatically fetch submodules or download the archives manually from GitHub.')
-  endif
-endif
-
 pb_files = [
   'src/utils/protomessage.cc',
-  gen.process('libs/lczero-common/proto/net.proto',
-    preserve_path_from : meson.current_source_dir() + '/libs/lczero-common/')
+  gen.process('proto/net.proto', preserve_path_from : meson.current_source_dir())
 ]
 common_files += pb_files
 
 # Extract git short revision.
 short_rev = 'unknown'
+git = find_program('git', required: false)
 if git.found()
   r = run_command(git, 'rev-parse', '--short', 'HEAD', check : false)
   if r.returncode() == 0
@@ -132,17 +116,11 @@ elif get_option('malloc') != ''
 endif
 
 # ONNX and HLO protobufs.
-gen_proto_src = generator(compile_proto, output: ['@BASENAME@.pb.h'],
-  arguments : [
-    '--proto_path=@CURRENT_SOURCE_DIR@/src',
-    '--cpp_out=@BUILD_DIR@',
-    '@INPUT@'])
+files += gen.process('proto/onnx.proto',
+  preserve_path_from : meson.current_source_dir())
 
-files += gen_proto_src.process('src/neural/onnx/onnx.proto',
-  preserve_path_from : meson.current_source_dir() + '/src/')
-
-files += gen_proto_src.process('src/neural/xla/hlo.proto',
-  preserve_path_from : meson.current_source_dir() + '/src/')
+files += gen.process('proto/hlo.proto',
+  preserve_path_from : meson.current_source_dir())
 
 #############################################################################
 ## Main files
@@ -229,6 +207,11 @@ files += [
 
 includes += include_directories('src')
 
+deps += dependency('absl_flat_hash_map', 'absl', modules:['absl::flat_hash_map'],
+                   include_type: 'system',
+                   fallback: ['abseil-cpp', 'absl_container_dep'],
+                   default_options : ['warning_level=0', 'cpp_std=c++20'])
+
 deps += dependency('threads')
 
 #############################################################################
@@ -249,9 +232,6 @@ if get_option('dag_classic')
     'src/search/dag_classic/search.cc',
     'src/search/dag_classic/wrapper.cc',
   ]
-
-  absl = subproject('abseil-cpp', default_options : ['warning_level=0', 'cpp_std=c++20'])
-  deps += absl.get_variable('absl_container_dep').as_system()
 endif
 
 #############################################################################
@@ -338,7 +318,13 @@ if get_option('build_backends')
 
     endif
 
-    deps += dependency('eigen3', fallback: ['eigen', 'eigen_dep']).as_system()
+    eigen_dep = dependency('eigen3')
+    # Check for needed header, bad dependency seen in the widl.
+    if eigen_dep.found() and cc.has_header('Eigen/Core', dependencies: eigen_dep)
+      deps += eigen_dep.as_system()
+    else
+      deps += subproject('eigen').get_variable('eigen_dep').as_system()
+    endif
 
     ispc = find_program('ispc', required: false)
     ispc_arch = 'x86-64'
@@ -466,48 +452,45 @@ if get_option('build_backends')
   ## cuDNN
   ## ~~~~~
   cudnn_libdirs = get_option('cudnn_libdirs')
+  nvcc_paths = []
+  foreach p : cudnn_libdirs
+    nvcc_paths += fs.parent(p) + '/bin/nvcc'
+  endforeach
+  nvcc_paths += ['nvcc', '/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc']
+  message('Looking for nvcc in: ' + ', '.join(nvcc_paths))
   cu_blas = cc.find_library('cublas', dirs: cudnn_libdirs, required: false)
   cu_dnn = cc.find_library('cudnn', dirs: cudnn_libdirs, required: false)
   cu_dart = cc.find_library('cudart', dirs: cudnn_libdirs, required: false)
-  nvcc = find_program('nvcc', '/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc',
+  nvcc = find_program(nvcc_paths,
                       required: false)
-
-  if (get_option('cudnn') or get_option('plain_cuda')) and cu_blas.found() and cu_dart.found() and nvcc.found()
-    deps += [cu_blas, cu_dart]
-    cuda_files = ['src/neural/backends/cuda/layers.cc']
-    if get_option('cudnn') and cu_dnn.found()
-      deps += cu_dnn
-      cuda_files += 'src/neural/backends/cuda/network_cudnn.cc'
-      cuda_files += 'src/neural/backends/cuda/network_cuda.cc' # To support newer nets.
-      add_project_arguments('-DUSE_CUDNN', language : 'cpp')
-    elif get_option('plain_cuda')
-      cuda_files += 'src/neural/backends/cuda/network_cuda.cc'
-    endif
+  nvcc_ok = false
+  if get_option('nvcc') and nvcc.found()
     foreach d : get_option('cudnn_include')
       if run_command('scripts/checkdir.py', d, check : false).returncode() == 0
         includes += include_directories(d, is_system: true)
       endif
     endforeach
-    includes += include_directories('src/neural/backends/cuda/')
-
-    cuda_arguments = ['-c', '@INPUT@', '-o', '@OUTPUT@',
-                      '-I', meson.current_source_dir() + '/src']
+    nvcc_io_arguments = ['-c', '@INPUT@', '-o', '@OUTPUT@']
+    nvcc_arguments = ['-I', meson.current_source_dir() + '/src']
     nvcc_help = run_command(nvcc, '-h', check : false).stdout()
     if host_machine.system() == 'windows'
       if get_option('b_vscrt') == 'mt'
-        cuda_arguments += ['-Xcompiler', '-MT']
+        nvcc_arguments += ['-Xcompiler', '-MT']
       elif get_option('b_vscrt') == 'mtd'
-        cuda_arguments += ['-Xcompiler', '-MTd']
+        nvcc_arguments += ['-Xcompiler', '-MTd']
       elif get_option('b_vscrt') == 'mdd' or (get_option('b_vscrt') == 'from_buildtype' and get_option('buildtype') == 'debug')
-        cuda_arguments += ['-Xcompiler', '-MDd']
+        nvcc_arguments += ['-Xcompiler', '-MDd']
       elif get_option('b_vscrt') != 'none'
-        cuda_arguments += ['-Xcompiler', '-MD']
+        nvcc_arguments += ['-Xcompiler', '-MD']
       endif
     else
-      cuda_arguments += ['--std=c++14', '-Xcompiler', '-fPIC']
+      nvcc_arguments += ['-Xcompiler', '-fPIC']
+      if get_option('debug')
+        nvcc_arguments += ['-g']
+      endif
     endif
     if get_option('nvcc_ccbin') != ''
-      cuda_arguments += ['-ccbin=' + get_option('nvcc_ccbin')]
+      nvcc_arguments += ['-ccbin=' + get_option('nvcc_ccbin')]
     endif
     cuda_cc = get_option('cc_cuda') # Unfortunately option cuda_cc is reserved.
     nvcc_extra_args = []
@@ -533,26 +516,95 @@ if get_option('build_backends')
       endif
     endif
     foreach x : get_option('cudnn_include')
-      cuda_arguments += ['-I', x]
+      nvcc_arguments += ['-I', x]
     endforeach
     if host_machine.system() == 'windows'
       outputname = '@BASENAME@.obj'
     else
       outputname = '@BASENAME@.o'
     endif
+    nvcc_ok = true
+
+    nvcc_stdversion_list = [20, 17, 14]
+    flag_not_supported = 'flag is not supported with the configured host compiler'
+    nvcc_stdversion = 14
+    foreach v : nvcc_stdversion_list
+      s = '--std=c++' + v.to_string()
+      nvcc_status = run_command(nvcc, '--dryrun', s, nvcc_extra_args, nvcc_arguments, 'foo.cu', check : false)
+      if host_machine.system() == 'windows'
+        nvcc_dryrun = nvcc_status.stdout()
+      else
+        nvcc_dryrun = nvcc_status.stderr()
+      endif
+      if nvcc_status.returncode() != 0 or nvcc_dryrun.contains(flag_not_supported)
+        continue
+      endif
+      nvcc_arguments += [s]
+      nvcc_stdversion = v
+      break
+    endforeach
+    message('Detected NVCC C++ standard support: ' + nvcc_stdversion.to_string())
+
+    max_cuda = 0
+    nvcc_status = run_command(nvcc, '--dryrun', nvcc_extra_args, nvcc_arguments, 'foo.cu', check : false)
+    if host_machine.system() == 'windows'
+      nvcc_dryrun = nvcc_status.stdout()
+    else
+      nvcc_dryrun = nvcc_status.stderr()
+    endif
+    foreach x : nvcc_dryrun.split()
+      if x.contains('__CUDA_ARCH__=')
+        arch = x.split('=')[1].to_int()
+        if arch > max_cuda
+          max_cuda = arch
+        endif
+      endif
+    endforeach
+    message('Detected maximum CUDA architecture: ' + max_cuda.to_string())
+  endif
+  if (get_option('cudnn') or get_option('plain_cuda')) and cu_dart.found() and cu_blas.found() and nvcc_ok
+    deps += [cu_blas, cu_dart]
+    cuda_files = ['src/neural/backends/cuda/layers.cc']
+    if get_option('cudnn') and cu_dnn.found()
+      deps += cu_dnn
+      cuda_files += 'src/neural/backends/cuda/network_cudnn.cc'
+      cuda_files += 'src/neural/backends/cuda/network_cuda.cc' # To support newer nets.
+      add_project_arguments('-DUSE_CUDNN', language : 'cpp')
+    elif get_option('plain_cuda')
+      cuda_files += 'src/neural/backends/cuda/network_cuda.cc'
+    endif
+    includes += include_directories('src/neural/backends/cuda/')
 	 files += cuda_files
+
+    if get_option('cutlass') and max_cuda >= 800 and nvcc_stdversion >= 17
+      message('Building with CUTLASS support')
+      add_project_arguments('-DUSE_CUTLASS', language : 'cpp')
+      nvcc_arguments += ['-DUSE_CUTLASS']
+      if get_option('cutlass_include') != ''
+        nvcc_arguments += ['-I', get_option('cutlass_include')]
+      else
+        nvcc_arguments += ['-I', subproject('cutlass').get_variable('include_directory')]
+      endif
+      nvcc_arguments += ['-isystem=@CURRENT_SOURCE_DIR@/third_party']
+      files += custom_target('cuda cutlass code',
+        input : 'src/neural/backends/cuda/cutlass_kernels.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+      )
+    endif
+
     files += custom_target('cuda fp32 code',
       input : 'src/neural/backends/cuda/common_kernels.cu',
       output : outputname,
       depend_files: 'src/neural/backends/cuda/winograd_helper.inc',
-      command : [nvcc, nvcc_extra_args, cuda_arguments]
+      command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
     )
 
     files += custom_target('cuda fp16 code',
       input : 'src/neural/backends/cuda/fp16_kernels.cu',
       output : outputname,
       depend_files: 'src/neural/backends/cuda/winograd_helper.inc',
-      command : [nvcc, nvcc_extra_args, cuda_arguments]
+      command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
     )
     has_backends = true
   endif
@@ -594,24 +646,45 @@ if get_option('build_backends')
   ## ~~~~~~~~~~
   onnxruntime = cc.find_library('onnxruntime', dirs: get_option('onnx_libdir'),
                                 required: false)
-  if get_option('onnx') and onnxruntime.found() and\
-     run_command('scripts/checkdir.py', get_option('onnx_include'), check: false).returncode() == 0
+  if get_option('onnx') and onnxruntime.found()
     deps += onnxruntime
-    includes += include_directories(get_option('onnx_include'), is_system: true)
-    cc.has_header('onnxruntime_cxx_api.h', required: true,
-                  args: '-I' + get_option('onnx_include'))
-    if not cc.has_header('cpu_provider_factory.h',
-                         args: '-I' + get_option('onnx_include'))
-      cc.has_header('../providers/cpu/cpu_provider_factory.h', required: true,
-                    args: '-I' + get_option('onnx_include'))
-      includes += include_directories(get_option('onnx_include') + '/../providers/cpu',
-                                      is_system: true)
+    onnx_inc_dir = get_option('onnx_include')
+    if fs.is_dir(onnx_inc_dir + '/onnxruntime/core/session')
+      # Top level of source dir.
+      onnx_inc_dir += '/onnxruntime/core/session'
+    elif fs.is_dir(onnx_inc_dir + '/onnxruntime')
+      onnx_inc_dir += '/onnxruntime'
     endif
-    files += 'src/neural/backends/network_onnx.cc'
+    includes += include_directories(onnx_inc_dir, is_system: true)
+    cc.has_header('onnxruntime_cxx_api.h', required: true,
+                  include_directories: includes)
+    files += 'src/neural/backends/onnx/network_onnx.cc'
+    onnx_conf = configuration_data()
+    if cc.has_header('dml_provider_factory.h', required: false,
+                     include_directories: includes)
+      # The header is not actually needed, used here to detect DML onnxruntime.
+      onnx_conf.set('USE_DML', true)
+    endif
     if cc.find_library('onnxruntime_providers_rocm',
                        dirs: get_option('onnx_libdir'), required: false).found()
-      add_project_arguments('-DUSE_ROCM', language : 'cpp')
+      onnx_conf.set('USE_ROCM', true)
     endif
+    if cc.find_library('onnxruntime_providers_migraphx',
+                       dirs: get_option('onnx_libdir'), required: false).found()
+      onnx_conf.set('USE_MIGRAPHX', true)
+    endif
+    if cu_dart.found() and nvcc_ok
+      onnx_conf.set('USE_ONNX_CUDART', true)
+      deps += cu_dart
+      files += custom_target('cuda onnx code',
+        input : 'src/neural/backends/onnx/onnx_kernels.cu',
+        output : outputname,
+        command : [nvcc, nvcc_extra_args, nvcc_arguments, nvcc_io_arguments]
+        )
+    else
+      warning('No CUDA support available. Using compatibility implementation for onnx-trt and onnx-cuda.')
+    endif
+    configure_file(output : 'onnx_conf.h', configuration : onnx_conf)
     has_backends = true
   endif
 
@@ -624,7 +697,7 @@ if get_option('build_backends')
                                 modules : ['Foundation', 'Metal', 'MetalPerformanceShaders', 'MetalPerformanceShadersGraph'],
                                 required: get_option('metal'))
 
-  if (metal_frameworks.found() and add_languages('objc', 'objcpp'))
+  if metal_frameworks.found() and add_languages('objc', 'objcpp', native: false)
     deps += metal_frameworks
 
     files += [
@@ -667,26 +740,6 @@ if get_option('build_backends')
       add_project_arguments('-fsycl', language : 'cpp')
       add_project_link_arguments('-fsycl', language : 'cpp')
 
-      dpct_args = []
-      foreach onemkl_include : get_option('onemkl_include')
-        if run_command('scripts/checkdir.py', onemkl_include, check : false).returncode() == 0
-          includes += include_directories(onemkl_include, is_system: true)
-          dpct_args += '-I' + onemkl_include
-        endif
-      endforeach
-      # Check for oneMKL header which is used by DPC++ CT. It could also depend
-      # on oneMATH headers but L0 Sycl uses oneMKL kernels too.
-      cc.has_header('oneapi/mkl.hpp', required: true, args: dpct_args)
-
-      foreach dpct_include : get_option('dpct_include')
-        if run_command('scripts/checkdir.py', dpct_include, check : false).returncode() == 0
-          includes += include_directories(dpct_include, is_system: true)
-          dpct_args += '-I' + dpct_include
-        endif
-      endforeach
-      # Check for DPC++ Compatibility Tool header.
-      cc.has_header('dpct/dpct.hpp', required: true, args: dpct_args)
-
       files += 'src/neural/backends/sycl/layers.cc.dp.cpp'
       files += 'src/neural/backends/sycl/network_sycl.cc.dp.cpp'
       files += 'src/neural/backends/sycl/common_kernels.dp.cpp'
@@ -704,7 +757,7 @@ if get_option('build_backends')
         hip_libdirs = get_option('hip_libdirs')
         hip_args = []
         foreach hip_include : get_option('hip_include')
-          if run_command('scripts/checkdir.py', dpct_include, check : false).returncode() == 0
+          if run_command('scripts/checkdir.py', hip_include, check : false).returncode() == 0
             includes += include_directories(hip_include, is_system: true)
             hip_args += '-I' + hip_include
           endif
@@ -715,11 +768,39 @@ if get_option('build_backends')
         cc.has_header('hip/hip_runtime.h', required: true, args: hip_args)
         add_project_arguments('-DUSE_HIPBLAS=ON', language : 'cpp')
         add_project_arguments('-D__HIP_PLATFORM_AMD__', language : 'cpp')
-        if get_option('amd_gfx') == ''
-          error('-Dsycl=amd requires specifying -Damd_gfx architecture identifier (e.g. 90a, 1100 or similar)')
+        amd_gfx = get_option('amd_gfx')
+        if amd_gfx == ''
+          amd_gfx = []
+          agent_enum = find_program('rocm_agent_enumerator', '/opt/rocm/bin/rocm_agent_enumerator',
+                      required: false)
+          if not agent_enum.found()
+            warning( '\'rocm_agent_enumerator\' not found. AMD GPU detection doesn\'t work. You can install rocminfo or set -Damd_gfx.')
+          elif meson.version().version_compare('<1.2.0')
+            warning( 'Automatic AMD GPU detection requires Meson 1.2.0')
+          else
+            agents = run_command(agent_enum, check : false).stdout()
+            agent_list = agents.splitlines()
+            foreach agent : agent_list
+              if agent.startswith('gfx')
+                amd_gfx += 'amd_gpu_' + agent
+              else
+                error( '\'' + agent_enum.full_path() + '\' unexpected output: ' + agent)
+              endif
+            endforeach
+            if amd_gfx.length() == 0
+              warning( '\'' + agent_enum.full_path() + '\' failed to detect any AMD GPUs in the system.')
+            else
+              message( 'Detected AMD GPU cores: ' + ','.join(amd_gfx))
+            endif
+          endif
+        else
+          amd_gfx = ['amd_gpu_' + amd_gfx]
         endif
-        add_project_arguments('-fsycl-targets=amd_gpu_gfx'+get_option('amd_gfx'), language : 'cpp')
-        add_project_link_arguments('-fsycl-targets=amd_gpu_gfx'+get_option('amd_gfx'), language : 'cpp')
+        if amd_gfx.length() == 0
+          error('-Dsycl=amd requires specifying -Damd_gfx architecture identifier (e.g. gfx90a, gfx1100 or similar)')
+        endif
+        add_project_arguments('-fsycl-targets=' + ','.join(amd_gfx), language : 'cpp')
+        add_project_link_arguments('-fsycl-targets=' + ','.join(amd_gfx), language : 'cpp')
       else
         deps += cc.find_library('cublas', required: true)
         deps += cc.find_library('cudart', required: true)
@@ -767,15 +848,53 @@ endif
     deps += dependency('zlib', fallback: ['zlib', 'zlib_dep'])
   endif
 
+  trace_lib = get_option('trace_library')
+  trace_config = configuration_data()
+
+  common_files += 'src/utils/trace.cc'
+  ## ~~~~~~~~
+  ## perfetto
+  ## ~~~~~~~~
+  if trace_lib == 'perfetto'
+    perfetto_dep = dependency('perfetto', required: true,
+                             fallback: ['perfetto', 'dep_perfetto'])
+    deps += perfetto_dep
+    trace_config.set('USE_PERFETTO_TRACE', 1)
+  endif
+
+  ## ~~~~
+  ## nvtx
+  ## ~~~~
+  if trace_lib == 'nvtx'
+    nvtx_includes = get_option('cudnn_include')
+    nvtx_header_found = false
+    foreach d : nvtx_includes
+      if run_command('scripts/checkdir.py', d, check : false).returncode() == 0
+        if cc.has_header('nvtx3/nvtx3.hpp', args: '-I' + d)
+          includes += include_directories(d)
+          nvtx_header_found = true
+          break
+        endif
+      endif
+    endforeach
+    if not nvtx_header_found
+      error('nvtx3/nvtx3.hpp header not found in cudnn_include paths')
+    endif
+    # This could support other tracing apis like systemtap.
+    trace_config.set('USE_NVTX_TRACE', 1)
+  endif
+  configure_file(output : 'trace_config.h',
+                 configuration : trace_config)
+
   ## ~~~~~~~~
   ## Profiler
   ## ~~~~~~~~
   if get_option('buildtype') != 'release'
-    deps += cc.find_library('libprofiler',
+    deps += cc.find_library('profiler',
       dirs: ['/usr/local/lib'], required: false)
   endif
 
-  deps += cc.find_library('libatomic', required: false)
+  deps += cc.find_library('atomic', required: false)
 
 #############################################################################
 ## Main Executable
@@ -826,10 +945,10 @@ endif
 #############################################################################
 
 if get_option('rescorer')
-  deps += subproject('gaviotatb').get_variable('gaviotatb_dep')
+  gaviota_dep = subproject('gaviotatb').get_variable('gaviotatb_dep')
   executable('rescorer', 'src/rescorer_main.cc',
        [common_files, 'src/trainingdata/rescorer.cc'],
-       include_directories: includes, dependencies: deps, install: true)
+       include_directories: includes, dependencies: [deps, gaviota_dep], install: true)
 endif
 
 #############################################################################
@@ -845,6 +964,11 @@ if get_option('gtest')
     executable('chessboard_test', 'src/chess/board_test.cc',
     include_directories: includes, link_with: lc0_lib, dependencies: gtest
   ), args: '--gtest_output=xml:chessboard.xml', timeout: 90)
+
+  test('FP16',
+    executable('fp16_test', 'src/utils/fp16_utils_test.cc',
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest
+  ), args: '--gtest_output=xml:fp16.xml', timeout: 90)
 
   test('HashCat',
     executable('hashcat_test', 'src/utils/hashcat_test.cc',

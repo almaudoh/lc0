@@ -30,7 +30,6 @@
 #include <initializer_list>
 
 #include "neural/onnx/adapters.h"
-#include "neural/onnx/onnx.pb.h"
 #include "utils/exception.h"
 #include "version.h"
 
@@ -297,6 +296,16 @@ std::string OnnxBuilder::Selu(const std::string& name,
                               const std::string& input) {
   auto* node = model_.mutable_graph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Selu");
+}
+
+std::string OnnxBuilder::Elu(const std::string& name, const std::string& input,
+                             float alpha) {
+  auto* node = model_.mutable_graph()->add_node();
+  auto out = PopulateStdNodeFields(node, name, input, "Elu");
+  if (alpha != 1.0f) {
+    AddFloatAttribute(node, "alpha", alpha);
+  }
+  return out;
 }
 
 std::vector<std::string> OnnxBuilder::Split(const std::string& name,
