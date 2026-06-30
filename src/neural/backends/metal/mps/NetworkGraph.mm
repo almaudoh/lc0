@@ -265,40 +265,29 @@ static const NSInteger kMinSubBatchSize = 20;
     NSUInteger lastSubBatchSize = batchSize - lastSubBatch * subBatchSize;
     NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
 
-    // Per-call result store: pre-allocated array of (splits) slots so concurrent
-    // completion handlers can write to disjoint indices without locking.
+    // Per-call result store: one slot per sub-batch, written by GPU completion handlers.
+    // Indexed by sub-batch number; each slot is written exactly once and read after
+    // all waitUntilCompleted calls, so no locking is needed during the read phase.
     NSMutableArray<NSArray<MPSGraphTensorData *> *> * resultStore =
         [NSMutableArray arrayWithCapacity:splits];
     for (NSUInteger i = 0; i < splits; i++) {
-        [resultStore addObject:@[]];  // placeholder; replaced by completion handler
+        [resultStore addObject:@[]];
     }
 
-    // Pre-allocate command buffer array with placeholder nils for indexed assignment.
-    NSMutableArray<MPSCommandBuffer *> * commandBuffers =
-        [NSMutableArray arrayWithCapacity:splits];
-    for (NSUInteger i = 0; i < splits; i++) {
-        [commandBuffers addObject:(MPSCommandBuffer *)[NSNull null]];
+    // Encode sub-batches sequentially and commit each immediately so the GPU can
+    // start work on sub-batch N while sub-batch N+1 is being encoded on the CPU.
+    NSMutableArray<MPSCommandBuffer *> * commandBuffers = [NSMutableArray arrayWithCapacity:splits];
+    for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
+        NSUInteger thisBatchSize = (subBatch < lastSubBatch) ? subBatchSize : lastSubBatchSize;
+        [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
+                                                               masks:masks + subBatch * inputDataLength
+                                                            subBatch:subBatch
+                                                        subBatchSize:thisBatchSize
+                                                         resultStore:resultStore]];
     }
-
-    // Encode all sub-batches concurrently on CPU.
-    // MPSGraphExecutable.encodeToCommandBuffer is thread-safe (Apple docs).
-    // Each sub-batch uses its own MPSCommandBuffer from an independent queue.
-    dispatch_apply(splits, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t subBatch) {
-        NSUInteger thisBatchSize = (subBatch < (NSUInteger)lastSubBatch) ? subBatchSize : lastSubBatchSize;
-        MPSCommandBuffer * cb = [self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                             masks:masks + subBatch * inputDataLength
-                                                          subBatch:subBatch
-                                                      subBatchSize:thisBatchSize
-                                                       resultStore:resultStore];
-        @synchronized(commandBuffers) {
-            commandBuffers[subBatch] = cb;
-        }
-    });
 
     for (MPSCommandBuffer * commandBuffer in commandBuffers) {
-        if ((id)commandBuffer != [NSNull null]) {
-            [commandBuffer waitUntilCompleted];
-        }
+        [commandBuffer waitUntilCompleted];
     }
 
     [self copyResultsToBuffers:outputBuffers
@@ -356,9 +345,11 @@ static const NSInteger kMinSubBatchSize = 20;
             if (error) {
                 NSLog(@"Metal inference error (sub-batch %lu): %@", (unsigned long)subBatch, error);
             } else {
-                // Each sub-batch index is unique within this call, so disjoint slot
-                // assignment requires no additional locking.
-                resultStore[subBatch] = results;
+                // Completion handlers for different sub-batches can fire concurrently on
+                // Metal's internal threads; @synchronized guards the NSMutableArray mutation.
+                @synchronized(resultStore) {
+                    resultStore[subBatch] = results;
+                }
             }
             dispatch_semaphore_signal(_inflightSemaphore);
         };
@@ -383,7 +374,9 @@ static const NSInteger kMinSubBatchSize = 20;
                 for (MPSGraphTensor * tensor in resultTensors) {
                     [results addObject:resultDictionary[tensor]];
                 }
-                resultStore[subBatch] = results;
+                @synchronized(resultStore) {
+                    resultStore[subBatch] = results;
+                }
             }
             dispatch_semaphore_signal(_inflightSemaphore);
         };
