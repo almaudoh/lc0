@@ -84,11 +84,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
 @end
 
-// Enhanced interface for compiled execution
 @interface Lc0NetworkGraph ()
-@property (nonatomic) BOOL isGraphBuilt;
-@property (nonatomic) BOOL isCompiled;
-@property (nonatomic, strong) NSError *compilationError;
 @property (nonatomic, strong) MPSGraphCompilationDescriptor *compilationDescriptor;
 @end
 
@@ -151,17 +147,18 @@ static const NSInteger kMinSubBatchSize = 20;
     // Initialize compilation state
     _isGraphBuilt = NO;
     _isCompiled = NO;
-    _compilationError = nil;
 
-    // Setup compilation descriptor with optimizations
-    _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
-    _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+    // Setup compilation descriptor with optimizations (macOS 13+ only).
     if (@available(macOS 13.0, *)) {
-        __weak Lc0NetworkGraph * weakSelf = self;
+        _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+        _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
-            __strong Lc0NetworkGraph * strongSelf = weakSelf;
-            strongSelf.compilationError = error;
+            if (error) {
+                NSLog(@"Metal graph compilation failed: %@", error);
+            }
         };
+    } else {
+        _compilationDescriptor = nil;
     }
     return self;
 }
@@ -179,7 +176,6 @@ static const NSInteger kMinSubBatchSize = 20;
     }
 
     if (@available(macOS 13.0, *)) {
-        // Prepare feeds dictionary with dynamic batch size.
         NSDictionary * feeds = @{
             _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
             _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
@@ -205,11 +201,11 @@ static const NSInteger kMinSubBatchSize = 20;
 {
     // Create minimal dummy data for warmup
     const NSUInteger warmupBatchSize = 1;
-    const NSUInteger inputChannels = [[_inputTensor.shape objectAtIndex:1] unsignedIntegerValue];
-    const NSUInteger inputSize = warmupBatchSize * inputChannels;
+    const NSUInteger inputSize = warmupBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
+    const NSUInteger maskSize = warmupBatchSize * [_maskTensor sizeOfDimensionsFrom:@1];
 
     float * dummyInputs = (float *)calloc(inputSize, sizeof(float));
-    uint64_t * dummyMasks = (uint64_t *)calloc(inputSize, sizeof(uint64_t));
+    uint64_t * dummyMasks = (uint64_t *)calloc(maskSize, sizeof(uint64_t));
 
     // Create dummy output buffers
     float ** dummyOutputs = (float **)malloc([_resultTensors count] * sizeof(float *));
@@ -252,6 +248,7 @@ static const NSInteger kMinSubBatchSize = 20;
     NSUInteger lastSubBatch = splits - 1;
     NSUInteger lastSubBatchSize = batchSize - lastSubBatch * subBatchSize;
     NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
+    NSUInteger maskDataLength = subBatchSize * [_maskTensor sizeOfDimensionsFrom:@1];
 
     // Per-call result store: one slot per sub-batch, written by GPU completion handlers.
     // Indexed by sub-batch number; each slot is written exactly once and read after
@@ -268,7 +265,7 @@ static const NSInteger kMinSubBatchSize = 20;
     for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
         NSUInteger thisBatchSize = (subBatch < lastSubBatch) ? subBatchSize : lastSubBatchSize;
         [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                               masks:masks + subBatch * inputDataLength
+                                                               masks:masks + subBatch * maskDataLength
                                                             subBatch:subBatch
                                                         subBatchSize:thisBatchSize
                                                          resultStore:resultStore]];
@@ -276,6 +273,25 @@ static const NSInteger kMinSubBatchSize = 20;
 
     for (MPSCommandBuffer * commandBuffer in commandBuffers) {
         [commandBuffer waitUntilCompleted];
+    }
+
+    // Verify all sub-batches produced valid results before copying. A missing or short entry
+    // means the GPU execution failed; zero the output buffers so callers get clean data.
+    NSUInteger numResults = [_resultTensors count];
+    BOOL valid = YES;
+    for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
+        if ([resultStore[subBatch] count] < numResults) {
+            NSLog(@"Metal inference: sub-batch %lu execution failed or returned incomplete results.", (unsigned long)subBatch);
+            valid = NO;
+            break;
+        }
+    }
+    if (!valid) {
+        for (NSUInteger rsIdx = 0; rsIdx < numResults; rsIdx++) {
+            NSUInteger totalElements = batchSize * [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1];
+            memset(outputBuffers[rsIdx], 0, totalElements * sizeof(float));
+        }
+        return _resultTensors;
     }
 
     [self copyResultsToBuffers:outputBuffers
@@ -323,30 +339,37 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                               shape:inputShape
                                                                            dataType:MPSDataTypeUInt64];
 
-    NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
+    if (@available(macOS 13.0, *)) {
+        if (_executable) {
+            // inputsArray order must match the executable's compiled input order, which follows
+            // tensor creation order in the graph: inputTensor (f32) first, maskTensor (ui64) second.
+            NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
 
-    if (_executable) {
-        // Compiled path (macOS 13+): MPSGraphExecutable.encodeToCommandBuffer is thread-safe;
-        // concurrent calls from dispatch_apply are safe here.
-        MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
-        executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
-            if (error) {
-                NSLog(@"Metal inference error (sub-batch %lu): %@", (unsigned long)subBatch, error);
-            } else {
-                // Completion handlers for different sub-batches can fire concurrently on
-                // Metal's internal threads; @synchronized guards the NSMutableArray mutation.
-                @synchronized(resultStore) {
-                    resultStore[subBatch] = results;
+            // Compiled path: MPSGraphExecutable.encodeToCommandBuffer is thread-safe;
+            // concurrent calls from different sub-batches are safe here.
+            MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+            executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
+                if (error) {
+                    NSLog(@"Metal inference error (sub-batch %lu): %@", (unsigned long)subBatch, error);
+                } else {
+                    @synchronized(resultStore) {
+                        resultStore[subBatch] = results;
+                    }
                 }
-            }
-            dispatch_semaphore_signal(_inflightSemaphore);
-        };
+                dispatch_semaphore_signal(_inflightSemaphore);
+            };
 
-        [_executable encodeToCommandBuffer:commandBuffer
-                               inputsArray:inputsArray
-                              resultsArray:nil
-                        executionDescriptor:executionDescriptor];
-    } else {
+            [_executable encodeToCommandBuffer:commandBuffer
+                                   inputsArray:inputsArray
+                                  resultsArray:nil
+                            executionDescriptor:executionDescriptor];
+
+            [commandBuffer commit];
+            return commandBuffer;
+        }
+    }
+
+    {
         // Eager fallback for macOS < 13 where graph compilation is unavailable.
         // MPSGraph eager encoding is not thread-safe; the caller (forwardEval) must
         // hold the network-level lock when taking this path.
@@ -393,11 +416,6 @@ static const NSInteger kMinSubBatchSize = 20;
         NSUInteger offset = 0;
         for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
             NSUInteger thisBatchSize = (subBatch < splits - 1) ? subBatchSize : lastSubBatchSize;
-            if ([resultStore[subBatch] count] < expectedResults) {
-                [NSException raise:@"MetalInferenceError"
-                            format:@"Sub-batch %lu produced no results (GPU error during inference).",
-                                   (unsigned long)subBatch];
-            }
             [[resultStore[subBatch][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
                                                      strideBytes:nil];
             offset += thisBatchSize * elementsPerItem;

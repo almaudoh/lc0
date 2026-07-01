@@ -38,6 +38,8 @@
 
 -(NSUInteger) sizeOfDimensions:(NSArray<NSNumber *> * __nonnull)dimensions;
 
+-(NSUInteger) sizeOfDimensionsFrom:(NSNumber * __nonnull)dimension;
+
 @end
 
 static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat16;
@@ -69,7 +71,6 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     MPSGraphExecutable * _executable;
     BOOL _isGraphBuilt;
     BOOL _isCompiled;
-    NSError * _compilationError;
 }
 
 +(Lc0NetworkGraph * _Nonnull) getGraphAt:(NSNumber * _Nonnull)index;
