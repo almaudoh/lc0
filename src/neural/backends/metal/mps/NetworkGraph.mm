@@ -152,6 +152,9 @@ static const NSInteger kMinSubBatchSize = 20;
         _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
         __weak Lc0NetworkGraph * weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
+            if (error) {
+                NSLog(@"Metal graph compilation failed: %@", error);
+            }
             __strong Lc0NetworkGraph * strongSelf = weakSelf;
             strongSelf.compilationError = error;
         };
@@ -235,7 +238,9 @@ static const NSInteger kMinSubBatchSize = 20;
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
     // Clear stale results so GPU errors from a prior call don't leak through as valid data.
-    [_resultDataDicts removeAllObjects];
+    @synchronized(self) {
+        [_resultDataDicts removeAllObjects];
+    }
 
     // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
     // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
@@ -274,13 +279,24 @@ static const NSInteger kMinSubBatchSize = 20;
         [commandBuffer waitUntilCompleted];
     }
 
-    // Verify all sub-batches produced results before copying; a missing entry means the
-    // GPU execution failed and the completion handler never populated _resultDataDicts.
+    // Verify all sub-batches produced valid results before copying. A missing or short entry
+    // means the GPU execution failed; zero the output buffers so callers get clean data.
+    NSUInteger numResults = [_resultTensors count];
+    BOOL valid = YES;
     for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
-        if (_resultDataDicts[@(subBatch)] == nil) {
-            NSLog(@"Metal inference: sub-batch %lu execution failed; results unavailable.", (unsigned long)subBatch);
-            return _resultTensors;
+        NSArray<MPSGraphTensorData *> * entry = _resultDataDicts[@(subBatch)];
+        if (entry == nil || [entry count] < numResults) {
+            NSLog(@"Metal inference: sub-batch %lu execution failed or returned incomplete results.", (unsigned long)subBatch);
+            valid = NO;
+            break;
         }
+    }
+    if (!valid) {
+        for (NSUInteger rsIdx = 0; rsIdx < numResults; rsIdx++) {
+            NSUInteger totalElements = batchSize * [_resultTensors[rsIdx] sizeOfDimensionsFrom:@1];
+            memset(outputBuffers[rsIdx], 0, totalElements * sizeof(float));
+        }
+        return _resultTensors;
     }
 
     [self copyResultsToBuffers:outputBuffers splits:splits subBatchSize:subBatchSize lastSubBatchSize:lastSubBatchSize];
@@ -330,7 +346,9 @@ static const NSInteger kMinSubBatchSize = 20;
                 if (error) {
                     NSLog(@"Error occurred during execution: %@", error);
                 } else {
-                    _resultDataDicts[@(subBatch)] = results;
+                    @synchronized(self) {
+                        _resultDataDicts[@(subBatch)] = results;
+                    }
                 }
                 dispatch_semaphore_signal(_doubleBufferingSemaphore);
             };
@@ -359,7 +377,9 @@ static const NSInteger kMinSubBatchSize = 20;
                 for (MPSGraphTensor * tensor in resultTensors) {
                     [results addObject:resultDictionary[tensor]];
                 }
-                _resultDataDicts[@(subBatch)] = results;
+                @synchronized(self) {
+                    _resultDataDicts[@(subBatch)] = results;
+                }
             }
             dispatch_semaphore_signal(_doubleBufferingSemaphore);
         };
