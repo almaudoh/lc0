@@ -84,11 +84,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
 @end
 
-// Enhanced interface for compiled execution
 @interface Lc0NetworkGraph ()
-@property (nonatomic) BOOL isGraphBuilt;
-@property (nonatomic) BOOL isCompiled;
-@property (nonatomic, strong) NSError *compilationError;
 @property (nonatomic, strong) MPSGraphCompilationDescriptor *compilationDescriptor;
 @end
 
@@ -144,19 +140,15 @@ static const NSInteger kMinSubBatchSize = 20;
     // Initialize compilation state
     _isGraphBuilt = NO;
     _isCompiled = NO;
-    _compilationError = nil;
 
     // Setup compilation descriptor with optimizations (macOS 13+ only).
     if (@available(macOS 13.0, *)) {
         _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
         _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
-        __weak Lc0NetworkGraph * weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             if (error) {
                 NSLog(@"Metal graph compilation failed: %@", error);
             }
-            __strong Lc0NetworkGraph * strongSelf = weakSelf;
-            strongSelf.compilationError = error;
         };
     } else {
         _compilationDescriptor = nil;
@@ -177,11 +169,12 @@ static const NSInteger kMinSubBatchSize = 20;
     }
 
     if (@available(macOS 13.0, *)) {
-        // Prepare feeds dictionary with dynamic batch size.
-        NSDictionary * feeds = @{
-            _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
-            _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
-        };
+        // Build feeds in explicit order and capture that order so inputsArray at inference
+        // time uses the same ordering the compiled executable expects.
+        NSMutableDictionary * feeds = [NSMutableDictionary dictionaryWithCapacity:2];
+        feeds[_inputTensor] = [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType];
+        feeds[_maskTensor] = [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType];
+        _feedTensors = [feeds allKeys];
 
         _executable = [self compileWithDevice:_device
                                         feeds:feeds
@@ -283,12 +276,14 @@ static const NSInteger kMinSubBatchSize = 20;
     // means the GPU execution failed; zero the output buffers so callers get clean data.
     NSUInteger numResults = [_resultTensors count];
     BOOL valid = YES;
-    for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
-        NSArray<MPSGraphTensorData *> * entry = _resultDataDicts[@(subBatch)];
-        if (entry == nil || [entry count] < numResults) {
-            NSLog(@"Metal inference: sub-batch %lu execution failed or returned incomplete results.", (unsigned long)subBatch);
-            valid = NO;
-            break;
+    @synchronized(self) {
+        for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
+            NSArray<MPSGraphTensorData *> * entry = _resultDataDicts[@(subBatch)];
+            if (entry == nil || [entry count] < numResults) {
+                NSLog(@"Metal inference: sub-batch %lu execution failed or returned incomplete results.", (unsigned long)subBatch);
+                valid = NO;
+                break;
+            }
         }
     }
     if (!valid) {
@@ -336,10 +331,18 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                               shape:inputShape
                                                                            dataType:MPSDataTypeUInt64];
 
-    NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> * tensorDataMap = @{
+        _inputTensor: inputTensorData,
+        _maskTensor: inputMaskData,
+    };
 
     if (@available(macOS 13.0, *)) {
         if (_executable) {
+            // Build inputsArray in the same order as the feeds dict captured at compile time.
+            NSMutableArray<MPSGraphTensorData *> * inputsArray = [NSMutableArray arrayWithCapacity:[_feedTensors count]];
+            for (MPSGraphTensor * tensor in _feedTensors) {
+                [inputsArray addObject:tensorDataMap[tensor]];
+            }
             // Compiled path (macOS 13+): use the pre-compiled executable.
             MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
             executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
@@ -409,8 +412,11 @@ static const NSInteger kMinSubBatchSize = 20;
         NSUInteger offset = 0;
         for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
             NSUInteger thisBatchSize = (subBatch < splits - 1) ? subBatchSize : lastSubBatchSize;
-            [[_resultDataDicts[@(subBatch)][rsIdx] mpsndarray] readBytes:outputBuffers[rsIdx] + offset
-                                                             strideBytes:nil];
+            MPSNDArray * ndarray;
+            @synchronized(self) {
+                ndarray = [_resultDataDicts[@(subBatch)][rsIdx] mpsndarray];
+            }
+            [ndarray readBytes:outputBuffers[rsIdx] + offset strideBytes:nil];
             offset += thisBatchSize * elementsPerItem;
         }
     }

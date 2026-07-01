@@ -68,9 +68,11 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
 
     // Graph queue compilation and execution.
     MPSGraphExecutable * _executable;
+    // Feed tensors in the order passed to compileWithDevice:feeds:... so that inputsArray
+    // at inference time uses the same ordering the compiled executable expects.
+    NSArray<MPSGraphTensor *> * _feedTensors;
     BOOL _isGraphBuilt;
     BOOL _isCompiled;
-    NSError * _compilationError;
 }
 
 +(Lc0NetworkGraph * _Nonnull) getGraphAt:(NSNumber * _Nonnull)index;
