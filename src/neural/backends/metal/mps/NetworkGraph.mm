@@ -146,15 +146,17 @@ static const NSInteger kMinSubBatchSize = 20;
     _isCompiled = NO;
     _compilationError = nil;
 
-    // Setup compilation descriptor with optimizations
-    _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
-    _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+    // Setup compilation descriptor with optimizations (macOS 13+ only).
     if (@available(macOS 13.0, *)) {
+        _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+        _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
         __weak Lc0NetworkGraph * weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             __strong Lc0NetworkGraph * strongSelf = weakSelf;
             strongSelf.compilationError = error;
         };
+    } else {
+        _compilationDescriptor = nil;
     }
     return self;
 }
@@ -270,6 +272,15 @@ static const NSInteger kMinSubBatchSize = 20;
 
     for (MPSCommandBuffer * commandBuffer in commandBuffers) {
         [commandBuffer waitUntilCompleted];
+    }
+
+    // Verify all sub-batches produced results before copying; a missing entry means the
+    // GPU execution failed and the completion handler never populated _resultDataDicts.
+    for (NSUInteger subBatch = 0; subBatch < splits; subBatch++) {
+        if (_resultDataDicts[@(subBatch)] == nil) {
+            NSLog(@"Metal inference: sub-batch %lu execution failed; results unavailable.", (unsigned long)subBatch);
+            return _resultTensors;
+        }
     }
 
     [self copyResultsToBuffers:outputBuffers splits:splits subBatchSize:subBatchSize lastSubBatchSize:lastSubBatchSize];
