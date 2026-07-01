@@ -38,6 +38,8 @@
 
 -(NSUInteger) sizeOfDimensions:(NSArray<NSNumber *> * __nonnull)dimensions;
 
+-(NSUInteger) sizeOfDimensionsFrom:(NSNumber * __nonnull)dimension;
+
 @end
 
 static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat16;

@@ -198,11 +198,11 @@ static const NSInteger kMinSubBatchSize = 20;
 {
     // Create minimal dummy data for warmup
     const NSUInteger warmupBatchSize = 1;
-    const NSUInteger inputChannels = [[_inputTensor.shape objectAtIndex:1] unsignedIntegerValue];
-    const NSUInteger inputSize = warmupBatchSize * inputChannels;
+    const NSUInteger inputSize = warmupBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
+    const NSUInteger maskSize = warmupBatchSize * [_maskTensor sizeOfDimensionsFrom:@1];
 
     float * dummyInputs = (float *)calloc(inputSize, sizeof(float));
-    uint64_t * dummyMasks = (uint64_t *)calloc(inputSize, sizeof(uint64_t));
+    uint64_t * dummyMasks = (uint64_t *)calloc(maskSize, sizeof(uint64_t));
 
     // Create dummy output buffers
     float ** dummyOutputs = (float **)malloc([_resultTensors count] * sizeof(float *));
@@ -248,13 +248,14 @@ static const NSInteger kMinSubBatchSize = 20;
     }
     NSUInteger subBatchSize = batchSize / splits;
     NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
+    NSUInteger maskDataLength = subBatchSize * [_maskTensor sizeOfDimensionsFrom:@1];
     // Split batchSize into smaller sub-batches and run using double-buffering.
     // Execute sub-batches with optimized scheduling
     NSMutableArray<MPSCommandBuffer *> * commandBuffers = [NSMutableArray arrayWithCapacity:splits];
 
     for (NSUInteger subBatch = 0; subBatch < splits - 1; subBatch++) {
         [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                               masks:masks + subBatch * inputDataLength
+                                                               masks:masks + subBatch * maskDataLength
                                                             subBatch:subBatch
                                                         subBatchSize:subBatchSize]];
     }
@@ -263,7 +264,7 @@ static const NSInteger kMinSubBatchSize = 20;
     NSUInteger lastSubBatch = splits - 1;
     NSUInteger lastSubBatchSize = batchSize - lastSubBatch * subBatchSize;
     [commandBuffers addObject:[self runCommandSubBatchWithInputs:inputs + lastSubBatch * inputDataLength
-                                                           masks:masks + lastSubBatch * inputDataLength
+                                                           masks:masks + lastSubBatch * maskDataLength
                                                         subBatch:lastSubBatch
                                                     subBatchSize:lastSubBatchSize]];
 
@@ -310,23 +311,30 @@ static const NSInteger kMinSubBatchSize = 20;
 
     NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
 
-    if (_executable) {
-        // Compiled path (macOS 13+): use the pre-compiled executable.
-        MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
-        executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
-            if (error) {
-                NSLog(@"Error occurred during execution: %@", error);
-            } else {
-                _resultDataDicts[@(subBatch)] = results;
-            }
-            dispatch_semaphore_signal(_doubleBufferingSemaphore);
-        };
+    if (@available(macOS 13.0, *)) {
+        if (_executable) {
+            // Compiled path (macOS 13+): use the pre-compiled executable.
+            MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+            executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
+                if (error) {
+                    NSLog(@"Error occurred during execution: %@", error);
+                } else {
+                    _resultDataDicts[@(subBatch)] = results;
+                }
+                dispatch_semaphore_signal(_doubleBufferingSemaphore);
+            };
 
-        [_executable encodeToCommandBuffer:commandBuffer
-                               inputsArray:inputsArray
-                              resultsArray:nil
-                        executionDescriptor:executionDescriptor];
-    } else {
+            [_executable encodeToCommandBuffer:commandBuffer
+                                   inputsArray:inputsArray
+                                  resultsArray:nil
+                            executionDescriptor:executionDescriptor];
+
+            [commandBuffer commit];
+            return commandBuffer;
+        }
+    }
+
+    {
         // Eager fallback for macOS < 13 where graph compilation is unavailable.
         NSDictionary * feeds = @{_inputTensor : inputTensorData, _maskTensor : inputMaskData};
         NSArray<MPSGraphTensor *> * resultTensors = _resultTensors;
