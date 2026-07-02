@@ -145,9 +145,18 @@ static const NSInteger kMinSubBatchSize = 20;
     if (@available(macOS 13.0, *)) {
         _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
         _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+        Lc0NetworkGraph * __weak weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             if (error) {
                 NSLog(@"Metal graph compilation failed: %@", error);
+                Lc0NetworkGraph * strongSelf = weakSelf;
+                if (strongSelf) {
+                    @synchronized(strongSelf) {
+                        strongSelf->_executable = nil;
+                        strongSelf->_feedTensors = nil;
+                        strongSelf->_isCompiled = NO;
+                    }
+                }
             }
         };
     } else {
