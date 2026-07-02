@@ -152,9 +152,18 @@ static const NSInteger kMinSubBatchSize = 20;
     if (@available(macOS 13.0, *)) {
         _compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
         _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+        Lc0NetworkGraph * __weak weakSelf = self;
         _compilationDescriptor.compilationCompletionHandler = ^(MPSGraphExecutable * __unused executable, NSError * error) {
             if (error) {
                 NSLog(@"Metal graph compilation failed: %@", error);
+                Lc0NetworkGraph * strongSelf = weakSelf;
+                if (strongSelf) {
+                    @synchronized(strongSelf) {
+                        strongSelf->_executable = nil;
+                        strongSelf->_feedTensors = nil;
+                        strongSelf->_isCompiled = NO;
+                    }
+                }
             }
         };
     } else {
@@ -176,9 +185,13 @@ static const NSInteger kMinSubBatchSize = 20;
     }
 
     if (@available(macOS 13.0, *)) {
+        // Define the canonical feed order explicitly. MPSGraphExecutable.encodeToCommandBuffer
+        // takes an ordered inputsArray; we store this order here so the inference path uses
+        // the exact same sequence without relying on NSDictionary key enumeration order.
+        _feedTensors = @[_inputTensor, _maskTensor];
         NSDictionary * feeds = @{
             _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
-            _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType]
+            _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType],
         };
 
         _executable = [self compileWithDevice:_device
@@ -339,14 +352,20 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                               shape:inputShape
                                                                            dataType:MPSDataTypeUInt64];
 
+    NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> * tensorDataMap = @{
+        _inputTensor: inputTensorData,
+        _maskTensor: inputMaskData,
+    };
+
     if (@available(macOS 13.0, *)) {
         if (_executable) {
-            // inputsArray order must match the executable's compiled input order, which follows
-            // tensor creation order in the graph: inputTensor (f32) first, maskTensor (ui64) second.
-            NSArray<MPSGraphTensorData *> * inputsArray = @[inputTensorData, inputMaskData];
-
-            // Compiled path: MPSGraphExecutable.encodeToCommandBuffer is thread-safe;
-            // concurrent calls from different sub-batches are safe here.
+            // Build inputsArray in the same order as _feedTensors (set explicitly in compileGraph).
+            // MPSGraphExecutable.encodeToCommandBuffer is thread-safe; concurrent calls from
+            // different sub-batches are safe here.
+            NSMutableArray<MPSGraphTensorData *> * inputsArray = [NSMutableArray arrayWithCapacity:[_feedTensors count]];
+            for (MPSGraphTensor * tensor in _feedTensors) {
+                [inputsArray addObject:tensorDataMap[tensor]];
+            }
             MPSGraphExecutableExecutionDescriptor * executionDescriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
             executionDescriptor.completionHandler = ^(NSArray<MPSGraphTensorData *> * results, NSError * error) {
                 if (error) {
@@ -443,6 +462,13 @@ static const NSInteger kMinSubBatchSize = 20;
 -(nonnull MPSGraphTensor *) inputPlaceholderWithInputChannels:(NSUInteger)channels
                                                         label:(NSString * __nullable)label
 {
+    // This graph object is a per-device singleton and may be rebuilt for a different network.
+    // Invalidate any previously compiled executable so inference cannot use a stale graph.
+    _executable = nil;
+    _feedTensors = nil;
+    _isGraphBuilt = NO;
+    _isCompiled = NO;
+
     // Create a placeholder tensor that can hold the specified number of sub-batches.
     _inputTensor = [self placeholderWithShape:@[@(-1), @(channels), @1]
                                      dataType:MPSDataTypeFloat32
