@@ -453,6 +453,13 @@ static const NSInteger kMinSubBatchSize = 20;
 -(nonnull MPSGraphTensor *) inputPlaceholderWithInputChannels:(NSUInteger)channels
                                                         label:(NSString * __nullable)label
 {
+    // This graph object is a per-device singleton and may be rebuilt for a different network.
+    // Invalidate any previously compiled executable so inference cannot use a stale graph.
+    _executable = nil;
+    _feedTensors = nil;
+    _isGraphBuilt = NO;
+    _isCompiled = NO;
+
     // Create a placeholder tensor that can hold the specified number of sub-batches.
     _inputTensor = [self placeholderWithShape:@[@(-1), @(channels), @1]
                                      dataType:MPSDataTypeFloat32
