@@ -169,12 +169,14 @@ static const NSInteger kMinSubBatchSize = 20;
     }
 
     if (@available(macOS 13.0, *)) {
-        // Build feeds in explicit order and capture that order so inputsArray at inference
-        // time uses the same ordering the compiled executable expects.
-        NSMutableDictionary * feeds = [NSMutableDictionary dictionaryWithCapacity:2];
-        feeds[_inputTensor] = [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType];
-        feeds[_maskTensor] = [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType];
-        _feedTensors = [feeds allKeys];
+        // Define the canonical feed order explicitly. MPSGraphExecutable.encodeToCommandBuffer
+        // takes an ordered inputsArray; we store this order here so the inference path uses
+        // the exact same sequence without relying on NSDictionary key enumeration order.
+        _feedTensors = @[_inputTensor, _maskTensor];
+        NSDictionary * feeds = @{
+            _inputTensor: [[MPSGraphShapedType alloc] initWithShape:_inputTensor.shape dataType:_inputTensor.dataType],
+            _maskTensor: [[MPSGraphShapedType alloc] initWithShape:_maskTensor.shape dataType:_maskTensor.dataType],
+        };
 
         _executable = [self compileWithDevice:_device
                                         feeds:feeds
@@ -338,7 +340,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     if (@available(macOS 13.0, *)) {
         if (_executable) {
-            // Build inputsArray in the same order as the feeds dict captured at compile time.
+            // Build inputsArray in the same order as _feedTensors (set explicitly in compileGraph).
             NSMutableArray<MPSGraphTensorData *> * inputsArray = [NSMutableArray arrayWithCapacity:[_feedTensors count]];
             for (MPSGraphTensor * tensor in _feedTensors) {
                 [inputsArray addObject:tensorDataMap[tensor]];
